@@ -77,7 +77,7 @@ type Leaderstats = {Wins: IntValue, Losses: IntValue, Streak: IntValue}
 
 local batch_counts: {[Player]: RateWindow} = {}
 local action_counts: {[Player]: RateWindow} = {}
-local queue: {[string]: Player} = {} --// song|difficulty -> the one player waiting on it
+local queue: {[string]: Player} = {} --// song / difficulty -> the one player waiting on it
 local player_queue_key: {[Player]: string} = {} --// reverse lookup so someone leaving can find their slot
 local active_matches: {[Player]: Player} = {} --// player -> opponent, who presses get sent to
 local player_match: {[Player]: MatchRecord} = {} --// only lasts till the result is decided, not the whole match
