@@ -1,4 +1,5 @@
 --// modules
+--// is this enough comments lol
 
 local Proxy = require(script.Proxy) --// wraps the class for every field (read or write)
 local Signal = require(script.Signal) --// custom signal, tells me how many listeners are connected
