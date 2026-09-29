@@ -1,5 +1,3 @@
---// Connected Discord-GitHub
-
 --// modules
 
 local Proxy = require(script.Proxy) --// wraps the class for every field (read or write)
