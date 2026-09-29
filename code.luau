@@ -1,5 +1,4 @@
 --// Connected Discord-GitHub 
-
 --!strict
 
 --// services
@@ -11,7 +10,7 @@ local data_store_service = game:GetService("DataStoreService")
 
 --// modules
 
-local SongCatalog = require(replicated_storage.ClientModules.SongCatalog) --// both live in replicated storage so the client can read the same catalog and config
+local SongCatalog = require(replicated_storage.ClientModules.SongCatalog) --// both are in repstorage so the client can read the same catalog and config
 local Config = require(replicated_storage.ClientModules.Config)
 
 --// remotes
@@ -19,22 +18,22 @@ local Config = require(replicated_storage.ClientModules.Config)
 local function make_remote(class_name: string, name: string): any
 	local remote = Instance.new(class_name)
 	remote.Name = name
-	remote.Parent = replicated_storage --// made here so the place file doesnt need them pre built
+	remote.Parent = replicated_storage --// made here so i dont gotta pre build them in the place file
 	return remote
 end
 
-local press_relay: RemoteEvent = make_remote("RemoteEvent", "PressRelay") --// note presses, forwarded straight to the opponent
-local pvp_remote: RemoteEvent = make_remote("RemoteEvent", "PvPRemote") --// queue, party and result actions all arrive here, payload.a says which
+local press_relay: RemoteEvent = make_remote("RemoteEvent", "PressRelay") --// note presses, just gets sent straight to the opponent
+local pvp_remote: RemoteEvent = make_remote("RemoteEvent", "PvPRemote") --// queue, party and result stuff all comes thru here, payload.a says which one
 local pvp_stats_function: RemoteFunction = make_remote("RemoteFunction", "PvPStatsFunction")
 
 --// settings
 
 local max_events_per_batch = 40
-local max_batches_per_second = 30 --// presses are frequent so batches get a way higher cap than menu actions
+local max_batches_per_second = 30 --// presses spam a lot so batches get a way higher cap than menu stuff
 local max_actions_per_second = 5
 local countdown_seconds = 3
 local min_match_duration_seconds = 5
-local pick_seconds = 15 --// how long both players have to send PickSong once a party fills
+local pick_seconds = 15 --// how long both ppl have to send PickSong after the party fills
 
 local valid_directions = {UP = true, DOWN = true, LEFT = true, RIGHT = true}
 local valid_sides = {Left = true, Right = true}
@@ -61,7 +60,7 @@ type PartyRecord = {
 	side: string,
 	joinable: string,
 	win_condition: string,
-	match_id: string?, --// nil while the party is open, filling it sets this and that is the lock
+	match_id: string?, --// nil while the party is open, when it fills this gets set and thats the lock
 }
 
 type SongPick = {song: string, difficulty: string}
@@ -71,20 +70,20 @@ type PartyPick = {
 	picks: {[Player]: SongPick},
 }
 
-type PlayerStats = {Wins: number, Losses: number, Draws: number, Streak: number, BestStreak: number} --// these keys are what sits in the datastore so they keep their casing
+type PlayerStats = {Wins: number, Losses: number, Draws: number, Streak: number, BestStreak: number} --// these keys are whats saved in the datastore so the casing stays
 type Leaderstats = {Wins: IntValue, Losses: IntValue, Streak: IntValue}
 
 --// state
 
 local batch_counts: {[Player]: RateWindow} = {}
 local action_counts: {[Player]: RateWindow} = {}
-local queue: {[string]: Player} = {} --// song|difficulty to the one player waiting on it
-local player_queue_key: {[Player]: string} = {} --// backwards lookup so a leaving player can find their slot
-local active_matches: {[Player]: Player} = {} --// player to opponent, this is who presses get relayed to
-local player_match: {[Player]: MatchRecord} = {} --// only lives until the result is decided, not for the whole match
+local queue: {[string]: Player} = {} --// song|difficulty -> the one player waiting on it
+local player_queue_key: {[Player]: string} = {} --// reverse lookup so someone leaving can find their slot
+local active_matches: {[Player]: Player} = {} --// player -> opponent, who presses get sent to
+local player_match: {[Player]: MatchRecord} = {} --// only lasts till the result is decided, not the whole match
 local parties: {[string]: PartyRecord} = {}
 local player_party_id: {[Player]: string} = {}
-local pick_states: {[string]: PartyPick} = {} --// match id to the song picks of a full party
+local pick_states: {[string]: PartyPick} = {} --// match id -> song picks of a full party
 local stats_cache: {[number]: PlayerStats} = {}
 local player_leaderstats: {[Player]: Leaderstats} = {}
 local match_stats_store = data_store_service:GetDataStore("PvPStats_v1")
@@ -92,14 +91,14 @@ local match_stats_store = data_store_service:GetDataStore("PvPStats_v1")
 --// stats
 
 local function as_number(value: any): number
-	return if typeof(value) == "number" then value else 0 --// saved data can be missing a field or hold junk
+	return if typeof(value) == "number" then value else 0 --// saved data can be missing stuff or just be junk
 end
 
 local function load_stats(user_id: number): PlayerStats
 	local cached = stats_cache[user_id]
 	if cached then return cached end
 	local success, data = pcall(match_stats_store.GetAsync, match_stats_store, tostring(user_id))
-	local saved: any = if success and typeof(data) == "table" then data else {} --// a failed read and a new player both start at zero
+	local saved: any = if success and typeof(data) == "table" then data else {} --// failed read and brand new player both just start at 0
 	local stats: PlayerStats = {
 		Wins = as_number(saved.Wins),
 		Losses = as_number(saved.Losses),
@@ -107,12 +106,12 @@ local function load_stats(user_id: number): PlayerStats
 		Streak = as_number(saved.Streak),
 		BestStreak = as_number(saved.BestStreak),
 	}
-	stats_cache[user_id] = stats --// this exact table is what match results edit and save, so it must stay the one copy
+	stats_cache[user_id] = stats --// this exact table is what results edit + save so theres only ever one copy
 	return stats
 end
 
 local function save_stats(user_id: number, stats: PlayerStats)
-	task.spawn(pcall, match_stats_store.UpdateAsync, match_stats_store, tostring(user_id), function() return stats end) --// spawned so a slow datastore never holds up the match result
+	task.spawn(pcall, match_stats_store.UpdateAsync, match_stats_store, tostring(user_id), function() return stats end) --// spawned so a slow datastore cant hold up the match result
 end
 
 local function make_int_value(parent: Instance, name: string): IntValue
@@ -124,25 +123,25 @@ end
 
 local function create_leaderstats(player: Player)
 	local folder = Instance.new("Folder")
-	folder.Name = "leaderstats" --// roblox looks for exactly this name to draw the player list
+	folder.Name = "leaderstats" --// roblox needs this exact name to show it on the player list
 	player_leaderstats[player] = {
 		Wins = make_int_value(folder, "Wins"),
 		Losses = make_int_value(folder, "Losses"),
 		Streak = make_int_value(folder, "Streak"),
 	}
-	folder.Parent = player --// parented last so the client gets it with the values already inside
+	folder.Parent = player --// parented last so the client gets it with the values already in it
 end
 
 local function sync_leaderstats(player: Player, stats: PlayerStats)
 	local leaderstats = player_leaderstats[player]
-	if not leaderstats then return end --// removed on leave, a stats load can finish after that
+	if not leaderstats then return end --// gets removed on leave, and a stats load can finish after that
 	leaderstats.Wins.Value = stats.Wins
 	leaderstats.Losses.Value = stats.Losses
 	leaderstats.Streak.Value = stats.Streak
 end
 
 local function push_stats(player: Player, stats: PlayerStats)
-	if not player.Parent then return end --// already gone, nobody to tell
+	if not player.Parent then return end --// they already left, no1 to tell
 	sync_leaderstats(player, stats)
 	pvp_remote:FireClient(player, {a = "StatsUpdated", stats = stats})
 end
@@ -153,7 +152,7 @@ local function is_rate_limited(windows: {[Player]: RateWindow}, player: Player, 
 	local now = os.clock()
 	local window = windows[player]
 	if not window or now - window.window_start >= 1 then
-		windows[player] = {count = 1, window_start = now} --// fixed one second window, one small table per player instead of a timestamp list
+		windows[player] = {count = 1, window_start = now} --// fixed 1 sec window, one small table per player instead of a list of timestamps
 		return false
 	end
 	window.count += 1
@@ -161,12 +160,12 @@ local function is_rate_limited(windows: {[Player]: RateWindow}, player: Player, 
 end
 
 local function make_queue_key(song: string, difficulty: string): string
-	return string.lower(song) .. "|" .. string.lower(difficulty) --// lowercased so casing cant split players into different queues
+	return string.lower(song) .. "|" .. string.lower(difficulty) --// lowercased so diff casing cant put ppl in separate queues
 end
 
 local function clear_queue(player: Player)
 	local key = player_queue_key[player]
-	if key and queue[key] == player then queue[key] = nil end --// the slot may already belong to someone else by now
+	if key and queue[key] == player then queue[key] = nil end --// the slot might be someone elses by now
 	player_queue_key[player] = nil
 end
 
@@ -174,7 +173,7 @@ local function end_match(player: Player)
 	local opponent = active_matches[player]
 	if not opponent then return end
 	active_matches[player] = nil
-	active_matches[opponent] = nil --// both sides go together so presses stop relaying either way
+	active_matches[opponent] = nil --// both get cleared together so presses stop relaying both ways
 	if opponent.Parent then pvp_remote:FireClient(opponent, {a = "OpponentLeft"}) end
 end
 
@@ -183,14 +182,14 @@ end
 local function load_charts(song: string): {[string]: any}?
 	local song_module = SongCatalog.FindSongModule(song)
 	if not song_module then return nil end
-	local success, data = pcall(require, song_module) --// pcall because one broken song module shouldnt error the whole handler
+	local success, data = pcall(require, song_module) --// pcall so one broken song module doesnt error the whole handler
 	if not success or typeof(data) ~= "table" or typeof(data.Charts) ~= "table" then return nil end
 	return data.Charts
 end
 
---// one place decides what is playable so the queue, party picks and the random fallback cant disagree
+--// one spot decides whats playable so queue, party picks and the random fallback cant disagree
 local function get_pvp_chart(song: any, difficulty: any): {any}?
-	if typeof(song) ~= "string" or typeof(difficulty) ~= "string" then return nil end --// this is client input, string.lower would happily take a number
+	if typeof(song) ~= "string" or typeof(difficulty) ~= "string" then return nil end --// this is client input, string.lower would just take a number lol
 	local charts = load_charts(song)
 	if not charts then return nil end
 	for chart_difficulty, chart in charts do
@@ -224,20 +223,20 @@ end
 local function get_min_duration(chart: {any}): number
 	local last_note_end = 0
 	for _, note in ipairs(chart) do
-		last_note_end = math.max(last_note_end, note.t + (if typeof(note.d) == "number" then note.d else 0)) --// d is an optional length added on top of the note time
+		last_note_end = math.max(last_note_end, note.t + (if typeof(note.d) == "number" then note.d else 0)) --// d is an optional length on top of the note time
 	end
-	return math.max(last_note_end / 1000 * 0.85, min_match_duration_seconds) --// note times are in ms, the floor is 85% of the last note time but never under the minimum
+	return math.max(last_note_end / 1000 * 0.85, min_match_duration_seconds) --// note times are in ms, floor is 85% of the last note time but never under the min
 end
 
 --// results
 
 local function record_win(winner: Player, loser: Player)
-	local winner_stats, loser_stats = load_stats(winner.UserId), load_stats(loser.UserId) --// these can yield on a cold cache
+	local winner_stats, loser_stats = load_stats(winner.UserId), load_stats(loser.UserId) --// these can yield if the cache is cold
 	winner_stats.Wins += 1
 	winner_stats.Streak += 1
 	winner_stats.BestStreak = math.max(winner_stats.BestStreak, winner_stats.Streak)
 	loser_stats.Losses += 1
-	loser_stats.Streak = 0 --// a loss ends the streak, a draw leaves it alone
+	loser_stats.Streak = 0 --// loss resets the streak, draw doesnt touch it
 	save_stats(winner.UserId, winner_stats)
 	save_stats(loser.UserId, loser_stats)
 	push_stats(winner, winner_stats)
@@ -254,10 +253,10 @@ local function record_draw(first: Player, second: Player)
 end
 
 local function pick_winner(first: Player, second: Player, first_report: MatchReport, second_report: MatchReport): Player?
-	if first_report.forfeited and second_report.forfeited then return nil end --// both left, nobody gets the win
-	if first_report.forfeited then return second end --// the side that forfeited loses no matter what either score was
+	if first_report.forfeited and second_report.forfeited then return nil end --// both left so no one wins
+	if first_report.forfeited then return second end --// whoever forfeited loses no matter what the scores were
 	if second_report.forfeited then return first end
-	if first_report.score > second_report.score then return first end --// > both ways so an equal score falls through to a draw
+	if first_report.score > second_report.score then return first end --// > both ways so equal scores fall thru to a draw
 	if second_report.score > first_report.score then return second end
 	return nil
 end
@@ -265,8 +264,8 @@ end
 local function try_resolve_match(record: MatchRecord)
 	local first, second = record.players[1], record.players[2]
 	local first_report, second_report = record.reports[first], record.reports[second]
-	if not first_report or not second_report then return end --// still waiting on the other side
-	player_match[first] = nil --// cleared before record_win because that can yield, a late report must find no match and cant resolve it twice
+	if not first_report or not second_report then return end --// still waiting on the other player
+	player_match[first] = nil --// cleared before record_win cuz it can yield, so a late report finds no match and cant resolve it twice
 	player_match[second] = nil
 	local winner = pick_winner(first, second, first_report, second_report)
 	if winner == nil then
@@ -278,8 +277,8 @@ end
 
 local function forfeit_match(player: Player)
 	local record = player_match[player]
-	if not record or record.reports[player] then return end --// no match, or they already reported so leaving costs nothing
-	record.reports[player] = {score = 0, accuracy = 0, forfeited = true} --// the flag decides the result, the score is never compared
+	if not record or record.reports[player] then return end --// no match, or they already reported so leaving doesnt cost them
+	record.reports[player] = {score = 0, accuracy = 0, forfeited = true} --// the flag decides the result, score never gets compared
 	try_resolve_match(record)
 end
 
@@ -297,7 +296,7 @@ local function announce_match(player: Player, role: string, opponent: Player, so
 	pvp_remote:FireClient(player, {a = "Matched", role = role, opponent = opponent.Name, song = song, difficulty = difficulty, countdown = countdown_seconds, matchId = match_id})
 end
 
---// the queue and the party pick both end up here so a match is set up the same way from either
+--// queue and party pick both end up here so matches get set up the same either way
 local function start_match(match_id: string, first: Player, first_role: string, second: Player, song: string, difficulty: string, chart: {any})
 	local record: MatchRecord = {id = match_id, players = {first, second}, start_time = os.clock(), min_duration = get_min_duration(chart), reports = {}}
 	player_match[first] = record
@@ -308,13 +307,13 @@ local function start_match(match_id: string, first: Player, first_role: string, 
 	announce_match(second, opposite_role(first_role), first, song, difficulty, match_id)
 end
 
---// a player already queued, matched or in a party cant start another of those
+--// if ur already queued, matched or in a party u cant start another one
 local function is_busy(player: Player): boolean
 	return active_matches[player] ~= nil or player_match[player] ~= nil or player_party_id[player] ~= nil
 end
 
 local function is_open_for(record: PartyRecord, viewer: Player): boolean
-	return record.match_id == nil and record.joinable == "Everyone" and record.owner.Parent ~= nil and record.owner ~= viewer --// a viewer never sees their own party as joinable
+	return record.match_id == nil and record.joinable == "Everyone" and record.owner.Parent ~= nil and record.owner ~= viewer --// u never see ur own party as joinable
 end
 
 local function build_open_party_list(viewer: Player): {any}
@@ -336,7 +335,7 @@ end
 
 local function broadcast_party_list()
 	for _, player in players:GetPlayers() do
-		pvp_remote:FireClient(player, {a = "PartyListUpdated", parties = build_open_party_list(player)}) --// built per player because each one has their own party left out
+		pvp_remote:FireClient(player, {a = "PartyListUpdated", parties = build_open_party_list(player)}) --// built per player cuz everyone has their own party left out
 	end
 end
 
@@ -348,10 +347,10 @@ local function cleanup_party_state(player: Player)
 	parties[record.id] = nil
 	local match_id = record.match_id
 	if not match_id then
-		broadcast_party_list() --// an open party vanished so every list is stale
+		broadcast_party_list() --// an open party is gone so every list is outdated
 		return
 	end
-	pick_states[match_id] = nil --// the pick timer still fires later but finds nothing
+	pick_states[match_id] = nil --// the pick timer still fires later but theres nothing there
 	for _, member in record.members do
 		if member == player then continue end
 		player_party_id[member] = nil
@@ -359,7 +358,7 @@ local function cleanup_party_state(player: Player)
 	end
 end
 
---// the picked song only counts if it is still playable, and the match needs its chart anyway, otherwise random
+--// picked song only counts if its still playable (match needs its chart anyway), otherwise random
 local function choose_party_song(pick: SongPick?): (string?, string?, {any}?)
 	if pick then
 		local chart = get_pvp_chart(pick.song, pick.difficulty)
@@ -370,19 +369,19 @@ end
 
 local function resolve_party_pick(match_id: string)
 	local pick_state = pick_states[match_id]
-	if not pick_state then return end --// someone left before the timer ran and cleanup already took it
+	if not pick_state then return end --// someone left before the timer ran and cleanup already got it
 	pick_states[match_id] = nil
 	local record = pick_state.record
 	parties[record.id] = nil
 	local owner, joiner = record.members[1], record.members[2]
-	player_party_id[owner] = nil --// the party is over from here whether or not a match starts
+	player_party_id[owner] = nil --// party is done from here on whether a match starts or not
 	player_party_id[joiner] = nil
 	if not owner.Parent or not joiner.Parent then return end
 	local chosen = record.members[math.random(1, 2)] --// only one of the two picks gets played
 	local song, difficulty, chart = choose_party_song(pick_state.picks[chosen])
 	if not song or not difficulty or not chart then
 		for _, member in {owner, joiner} do
-			if member.Parent then pvp_remote:FireClient(member, {a = "OpponentLeft"}) end --// nothing playable at all, so both get the same OpponentLeft a leaver would cause
+			if member.Parent then pvp_remote:FireClient(member, {a = "OpponentLeft"}) end --// nothing playable at all so both get the same OpponentLeft a leaver would cause
 		end
 		return
 	end
@@ -393,13 +392,13 @@ local function announce_party_ready(player: Player, role: string, opponent: Play
 	pvp_remote:FireClient(player, {a = "PartyReady", role = role, opponent = opponent.Name, matchId = match_id, pickSeconds = pick_seconds})
 end
 
---// dying only backs out of things that arent locked in yet
+--// dying only backs u out of stuff that isnt locked in yet
 local function handle_reset(player: Player)
 	if player_match[player] or active_matches[player] then return end
 	clear_queue(player)
 	local party_id = player_party_id[player]
 	local record = if party_id then parties[party_id] else nil
-	if record and record.match_id == nil then cleanup_party_state(player) end --// a full party is already in its pick window so it is left alone
+	if record and record.match_id == nil then cleanup_party_state(player) end --// full party is already in its pick window so leave it alone
 end
 
 local function hook_character(player: Player, character: Model)
@@ -408,8 +407,8 @@ local function hook_character(player: Player, character: Model)
 	humanoid.Died:Connect(function() handle_reset(player) end)
 end
 
---// actions, every handler gets the player and the raw payload, anything in it can be junk since it came from a client
---// party and match ids arent typeof checked, a wrong typed id never indexes or equals anything real
+--// actions, every handler gets the player + raw payload, anything in it can be junk cuz it came from a client
+--// party and match ids arent typeof checked, a wrong type id never indexes or equals anything real anyway
 
 local handlers: {[string]: (Player, any) -> ()} = {}
 
@@ -418,7 +417,7 @@ handlers.Queue = function(player: Player, payload: any)
 	local song, difficulty = payload.song, payload.difficulty
 	local chart = get_pvp_chart(song, difficulty)
 	if not chart then return end
-	clear_queue(player) --// one slot per player, and it frees their own old slot so they cant match themselves
+	clear_queue(player) --// one slot per player, and this frees their old slot so they cant match w themselves
 	local key = make_queue_key(song, difficulty)
 	local waiting = queue[key]
 	if waiting and waiting.Parent then
@@ -426,7 +425,7 @@ handlers.Queue = function(player: Player, payload: any)
 		player_queue_key[waiting] = nil
 		start_match(http_service:GenerateGUID(false), waiting, "Player", player, song, difficulty, chart) --// whoever waited first is the Player
 	else
-		queue[key] = player --// also covers a waiter that left without clearing, their stale entry gets replaced
+		queue[key] = player --// also covers a waiter that left w/o clearing, their old entry just gets replaced
 		player_queue_key[player] = key
 		pvp_remote:FireClient(player, {a = "Waiting", song = song, difficulty = difficulty})
 	end
@@ -437,7 +436,7 @@ handlers.Cancel = function(player: Player)
 end
 
 handlers.EndMatch = function(player: Player)
-	forfeit_match(player) --// records the loss first, then end_match unlinks the pair and tells the opponent
+	forfeit_match(player) --// records the loss first, then end_match unlinks them and tells the opponent
 	end_match(player)
 end
 
@@ -445,9 +444,9 @@ handlers.ReportResult = function(player: Player, payload: any)
 	local score, accuracy = payload.score, payload.accuracy
 	if typeof(score) ~= "number" or typeof(accuracy) ~= "number" then return end
 	local record = player_match[player]
-	if not record or record.id ~= payload.matchId then return end --// has to be the match this player is really in, and not decided yet
+	if not record or record.id ~= payload.matchId then return end --// has to be the match theyre actually in and not decided yet
 	if record.reports[player] then return end --// first report counts, no resending
-	if os.clock() - record.start_time < record.min_duration then return end --// too early to be a real finish, this is what stops instant fake results
+	if os.clock() - record.start_time < record.min_duration then return end --// too early to be a real finish, this stops instant fake results
 	record.reports[player] = {score = math.clamp(score, 0, Config.MaxScore), accuracy = math.clamp(accuracy, 0, 100), forfeited = false}
 	try_resolve_match(record)
 end
@@ -468,14 +467,14 @@ handlers.JoinParty = function(player: Player, payload: any)
 	if not record or not is_open_for(record, player) then return end
 	local match_id = http_service:GenerateGUID(false)
 	table.insert(record.members, player)
-	record.match_id = match_id --// this is the lock, from here is_open_for is false and the party drops out of every list
+	record.match_id = match_id --// this is the lock, from here is_open_for is false and the party leaves every list
 	player_party_id[player] = record.id
 	pick_states[match_id] = {record = record, picks = {}}
 	broadcast_party_list()
 	local owner_role = role_for_side(record.side)
 	announce_party_ready(record.owner, owner_role, player, match_id)
 	announce_party_ready(player, opposite_role(owner_role), record.owner, match_id)
-	task.delay(pick_seconds, resolve_party_pick, match_id) --// the pick window ends here whether or not anyone picked
+	task.delay(pick_seconds, resolve_party_pick, match_id) --// pick window ends here even if no1 picked
 end
 
 handlers.LeaveParty = function(player: Player)
@@ -490,7 +489,7 @@ handlers.PickSong = function(player: Player, payload: any)
 	local pick_state = pick_states[payload.matchId]
 	if not pick_state or not table.find(pick_state.record.members, player) then return end
 	if not get_pvp_chart(payload.song, payload.difficulty) then return end
-	pick_state.picks[player] = {song = payload.song, difficulty = payload.difficulty} --// last pick wins, and only one of the two picks is used later
+	pick_state.picks[player] = {song = payload.song, difficulty = payload.difficulty} --// last pick wins, and only one of the two picks gets used later
 end
 
 --// connections
@@ -508,9 +507,9 @@ press_relay.OnServerEvent:Connect(function(player: Player, events: any)
 	local opponent = active_matches[player]
 	if not opponent or not opponent.Parent then return end
 	local sanitized = {}
-	for _, event: any in ipairs(events) do --// ipairs walks only the array part, the same part the size cap above counted
+	for _, event: any in ipairs(events) do --// ipairs only goes thru the array part, same part the size cap counted
 		if typeof(event) == "table" and (event.t == "press" or event.t == "release") and valid_directions[event.d] then
-			table.insert(sanitized, {t = event.t, d = event.d}) --// rebuilt with just t and d so a client cant push extra fields to the opponent
+			table.insert(sanitized, {t = event.t, d = event.d}) --// rebuilt w just t and d so a client cant send extra fields to the opponent
 		end
 	end
 	if #sanitized == 0 then return end
