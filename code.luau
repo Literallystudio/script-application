@@ -1,295 +1,540 @@
---// 500 comments
+--// Connected Discord-GitHub 
+
+--!strict
 
 --// services
 
 local replicated_storage = game:GetService("ReplicatedStorage")
 local players = game:GetService("Players")
-local tween_service = game:GetService("TweenService") --// only used for GetValue, the actual tweening is done by hand below
+local http_service = game:GetService("HttpService")
+local data_store_service = game:GetService("DataStoreService")
 
 --// modules
 
-local config = require(replicated_storage:WaitForChild("ClientModules"):WaitForChild("Config")) --// every tweakable number lives in here so i dont have to touch this file to tune the camera
+local SongCatalog = require(replicated_storage.ClientModules.SongCatalog) --// both live in replicated storage so the client can read the same catalog and config
+local Config = require(replicated_storage.ClientModules.Config)
+
+--// remotes
+
+local function make_remote(class_name: string, name: string): any
+	local remote = Instance.new(class_name)
+	remote.Name = name
+	remote.Parent = replicated_storage --// made here so the place file doesnt need them pre built
+	return remote
+end
+
+local press_relay: RemoteEvent = make_remote("RemoteEvent", "PressRelay") --// note presses, forwarded straight to the opponent
+local pvp_remote: RemoteEvent = make_remote("RemoteEvent", "PvPRemote") --// queue, party and result actions all arrive here, payload.a says which
+local pvp_stats_function: RemoteFunction = make_remote("RemoteFunction", "PvPStatsFunction")
+
+--// settings
+
+local max_events_per_batch = 40
+local max_batches_per_second = 30 --// presses are frequent so batches get a way higher cap than menu actions
+local max_actions_per_second = 5
+local countdown_seconds = 3
+local min_match_duration_seconds = 5
+local pick_seconds = 15 --// how long both players have to send PickSong once a party fills
+
+local valid_directions = {UP = true, DOWN = true, LEFT = true, RIGHT = true}
+local valid_sides = {Left = true, Right = true}
+local valid_joinable = {Everyone = true, Nobody = true}
+local valid_win_conditions = {Score = true, Accuracy = true, Misses = true}
 
 --// types
 
-type Ease = {Style: Enum.EasingStyle, Direction: Enum.EasingDirection}
+type RateWindow = {count: number, window_start: number}
+type MatchReport = {score: number, accuracy: number, forfeited: boolean}
 
---// ui refs
-
-local main_ui = players.LocalPlayer.PlayerGui:WaitForChild("MainUI") --// waitforchild cus the gui can load after this module gets required
-local camera_root = main_ui:WaitForChild("CameraRoot") --// frame holding the whole playfield, moving and scaling this is the "camera"
-local focus_points = camera_root:WaitForChild("FocusPoints") --// markers inside the root so they move around with it
-local scale = camera_root:FindFirstChildOfClass("UIScale") --// zoom is a uiscale so every child scales with it for free
-
-if scale == nil then
-	scale = Instance.new("UIScale") --// made here when the ui doesnt have one, so nothing below needs a nil check
-	scale.Parent = camera_root
-end
-
-local focus_targets = { --// char from the event to its marker, 0 = player, 1 = opponent, 2 = center
-	[0] = focus_points:FindFirstChild("PlayerFocus"),
-	[1] = focus_points:FindFirstChild("OpponentFocus"),
-	[2] = focus_points:FindFirstChild("CenterFocus"),
+type MatchRecord = {
+	id: string,
+	players: {Player},
+	start_time: number,
+	min_duration: number,
+	reports: {[Player]: MatchReport},
 }
 
-local focus_anchor = config.CameraFocusAnchor or UDim2.fromScale(0.5, 0.5) --// spot on screen the focused marker gets pulled to, center by default
-local base_position = camera_root.Position --// remembered so Reset can put the root back where it started
-
-local camera_handle = {}
-
---// easing
-
-local ease_styles = { --// chart events name their eases as strings so this turns them into enums
-	linear = Enum.EasingStyle.Linear,
-	sine = Enum.EasingStyle.Sine,
-	quad = Enum.EasingStyle.Quad,
-	cubic = Enum.EasingStyle.Cubic,
-	quart = Enum.EasingStyle.Quart,
-	quint = Enum.EasingStyle.Quint,
-	expo = Enum.EasingStyle.Exponential,
-	circ = Enum.EasingStyle.Circular,
-	back = Enum.EasingStyle.Back,
-	bounce = Enum.EasingStyle.Bounce,
-	elastic = Enum.EasingStyle.Elastic,
-	classic = Enum.EasingStyle.Quad, --// classic is just quad
+type PartyRecord = {
+	id: string,
+	owner: Player,
+	members: {Player},
+	side: string,
+	joinable: string,
+	win_condition: string,
+	match_id: string?, --// nil while the party is open, filling it sets this and that is the lock
 }
 
-local directions = { --// order matters, inout has to be checked first cus it also ends with "out"
-	{"inout", Enum.EasingDirection.InOut},
-	{"in", Enum.EasingDirection.In},
-	{"out", Enum.EasingDirection.Out},
+type SongPick = {song: string, difficulty: string}
+
+type PartyPick = {
+	record: PartyRecord,
+	picks: {[Player]: SongPick},
 }
 
-local function parse_ease(ease_name: string?): Ease
-	local key = (ease_name or ""):lower() --// so QuadOut and quadout both work
-	local direction = Enum.EasingDirection.InOut
-	for _, entry in directions do
-		local suffix = entry[1]
-		if key:sub(-#suffix) == suffix then
-			direction = entry[2]
-			key = key:sub(1, -#suffix - 1) --// chop the direction off the end so only the style name is left
-			break
-		end
-	end
-	return { Style = ease_styles[key] or Enum.EasingStyle.Quad, Direction = direction } --// a typo in a chart shouldnt error, just fall back to quad
-end
-
---// tracks, a value that can snap or animate. done by hand instead of tweenservice cus it has to follow the song clock (not real time) or pausing desyncs it
-
-local track = {}
-track.__index = track
-
-local function new_track(start)
-	return setmetatable({ value = start, anim = nil }, track)
-end
-
-function track.snap(self, target)
-	self.value, self.anim = target, nil --// clears the anim too or it would drag the value away from the snap
-end
-
-function track.animate(self, target, now_ms: number, seconds: number, ease: Ease)
-	self.anim = {
-		from = self.value, --// starts from wherever it is right now so cutting a pan off mid way doesnt jump
-		to = target,
-		start_ms = now_ms,
-		duration_ms = seconds * 1000, --// song time is in ms
-		ease = ease,
-	}
-end
-
-function track.step(self, now_ms: number)
-	local anim = self.anim
-	if anim == nil then return end --// nothing running so the value just stays
-	local elapsed = now_ms - anim.start_ms
-	if elapsed >= anim.duration_ms then
-		self.value, self.anim = anim.to, nil --// done, land exactly on the target and clear the anim
-	else
-		local alpha = math.clamp(elapsed / anim.duration_ms, 0, 1) --// clamp for when song time jumps back a little
-		local eased = tween_service:GetValue(alpha, anim.ease.Style, anim.ease.Direction) --// just runs the curve, no tween object gets made
-		self.value = anim.from + (anim.to - anim.from) * eased --// plain lerp, works on numbers and vector2s the same way
-	end
-end
+type PlayerStats = {Wins: number, Losses: number, Draws: number, Streak: number, BestStreak: number} --// these keys are what sits in the datastore so they keep their casing
+type Leaderstats = {Wins: IntValue, Losses: IntValue, Streak: IntValue}
 
 --// state
 
-local start_values = { --// what every track starts at and goes back to on Reset
-	focus_point = Vector2.new(0.5, 0.5), --// which spot of the root (0 to 1) sits under the anchor, middle to start
-	focus_offset = Vector2.new(focus_anchor.X.Offset, focus_anchor.Y.Offset), --// pixel nudge on top of the focus, comes from x and y in the event
-	base_zoom = 1, --// zoom from ZoomCamera events
-	focus_zoom = 1, --// separate zoom from focusing, multiplied with base_zoom later so they dont fight over one number
-}
+local batch_counts: {[Player]: RateWindow} = {}
+local action_counts: {[Player]: RateWindow} = {}
+local queue: {[string]: Player} = {} --// song|difficulty to the one player waiting on it
+local player_queue_key: {[Player]: string} = {} --// backwards lookup so a leaving player can find their slot
+local active_matches: {[Player]: Player} = {} --// player to opponent, this is who presses get relayed to
+local player_match: {[Player]: MatchRecord} = {} --// only lives until the result is decided, not for the whole match
+local parties: {[string]: PartyRecord} = {}
+local player_party_id: {[Player]: string} = {}
+local pick_states: {[string]: PartyPick} = {} --// match id to the song picks of a full party
+local stats_cache: {[number]: PlayerStats} = {}
+local player_leaderstats: {[Player]: Leaderstats} = {}
+local match_stats_store = data_store_service:GetDataStore("PvPStats_v1")
 
-local tracks = {}
-for name, value in start_values do tracks[name] = new_track(value) end --// one track per value so Update and Reset can just loop them
+--// stats
 
-local has_focused = false --// first focus snaps instead of panning or the camera would slide in from the middle at song start
-
-local events, event_step = {}, 1 --// event_step is the next event that hasnt run yet
-local song_time_ms = 0 --// saved every Update so the actions below know what time to start their anims at
-
-local ms_per_beat = 0
-local last_beat_index = -1 --// last beat already handled so a bump only starts once per beat
-local bump_start_ms = -1e9 --// way in the past so theres no bump before the first beat
-
-local base_bump_amount = config.CameraBeatBumpAmount or 0.015
-local base_bump_every = math.max(config.CameraBeatBumpEvery or 1, 1) --// min 1 or the modulo in evaluate_bump would divide by 0
-local bop_intensity = 1 --// multiplier on the bump, events change it
-local bop_rate = base_bump_every --// bump every x beats, also event controlled
-
-local pan_speed_multiplier = 1 --// pan duration gets divided by this so bigger means faster pans
-local min_scale, max_scale = 0, math.huge --// no clamp until SetScaleClamp gets called
-
---// beat bump
-
-local function set_bpm(bpm)
-	if bpm == nil or bpm <= 0 then bpm = config.DefaultBPM or 100 end --// bad or missing bpm falls back to the config one
-	ms_per_beat = 60000 / bpm --// 60000 ms in a minute
-	last_beat_index = -1 --// old beat index means nothing at the new bpm
-	bump_start_ms = -1e9
+local function as_number(value: any): number
+	return if typeof(value) == "number" then value else 0 --// saved data can be missing a field or hold junk
 end
 
-set_bpm(config.DefaultBPM)
+local function load_stats(user_id: number): PlayerStats
+	local cached = stats_cache[user_id]
+	if cached then return cached end
+	local success, data = pcall(match_stats_store.GetAsync, match_stats_store, tostring(user_id))
+	local saved: any = if success and typeof(data) == "table" then data else {} --// a failed read and a new player both start at zero
+	local stats: PlayerStats = {
+		Wins = as_number(saved.Wins),
+		Losses = as_number(saved.Losses),
+		Draws = as_number(saved.Draws),
+		Streak = as_number(saved.Streak),
+		BestStreak = as_number(saved.BestStreak),
+	}
+	stats_cache[user_id] = stats --// this exact table is what match results edit and save, so it must stay the one copy
+	return stats
+end
 
-local function evaluate_bump(time_ms)
-	local beat_index = math.floor(time_ms / ms_per_beat) --// which beat we are on right now
-	if beat_index ~= last_beat_index then --// only runs on the frame the beat changes
-		last_beat_index = beat_index
-		if beat_index % bop_rate == 0 then bump_start_ms = beat_index * ms_per_beat end --// exact beat time instead of now so one laggy frame doesnt shift the bump, modulo skips beats when the rate is over 1
+local function save_stats(user_id: number, stats: PlayerStats)
+	task.spawn(pcall, match_stats_store.UpdateAsync, match_stats_store, tostring(user_id), function() return stats end) --// spawned so a slow datastore never holds up the match result
+end
+
+local function make_int_value(parent: Instance, name: string): IntValue
+	local value = Instance.new("IntValue")
+	value.Name = name
+	value.Parent = parent
+	return value
+end
+
+local function create_leaderstats(player: Player)
+	local folder = Instance.new("Folder")
+	folder.Name = "leaderstats" --// roblox looks for exactly this name to draw the player list
+	player_leaderstats[player] = {
+		Wins = make_int_value(folder, "Wins"),
+		Losses = make_int_value(folder, "Losses"),
+		Streak = make_int_value(folder, "Streak"),
+	}
+	folder.Parent = player --// parented last so the client gets it with the values already inside
+end
+
+local function sync_leaderstats(player: Player, stats: PlayerStats)
+	local leaderstats = player_leaderstats[player]
+	if not leaderstats then return end --// removed on leave, a stats load can finish after that
+	leaderstats.Wins.Value = stats.Wins
+	leaderstats.Losses.Value = stats.Losses
+	leaderstats.Streak.Value = stats.Streak
+end
+
+local function push_stats(player: Player, stats: PlayerStats)
+	if not player.Parent then return end --// already gone, nobody to tell
+	sync_leaderstats(player, stats)
+	pvp_remote:FireClient(player, {a = "StatsUpdated", stats = stats})
+end
+
+--// limits and queue
+
+local function is_rate_limited(windows: {[Player]: RateWindow}, player: Player, max_per_second: number): boolean
+	local now = os.clock()
+	local window = windows[player]
+	if not window or now - window.window_start >= 1 then
+		windows[player] = {count = 1, window_start = now} --// fixed one second window, one small table per player instead of a timestamp list
+		return false
 	end
-	local elapsed = time_ms - bump_start_ms
-	if elapsed < 0 or elapsed >= ms_per_beat then return 0 end --// a bump only lasts one beat
-	local decay = 1 - tween_service:GetValue(elapsed / ms_per_beat, Enum.EasingStyle.Quad, Enum.EasingDirection.Out) --// flipped so it starts full and eases down to 0
-	return base_bump_amount * bop_intensity * decay
+	window.count += 1
+	return window.count > max_per_second
 end
 
---// ui math
-
-local function get_local_fraction(target)
-	local root_size = camera_root.AbsoluteSize
-	if root_size.X <= 0 or root_size.Y <= 0 then return Vector2.new(0.5, 0.5) end --// ui hasnt laid out yet so dividing would give inf, just say center
-	local target_center = target.AbsolutePosition + target.AbsoluteSize * 0.5 --// absolute space so it doesnt matter how deep the marker is parented
-	return (target_center - camera_root.AbsolutePosition) / root_size --// 0 to 1 across the root instead of pixels, stays valid at any zoom
+local function make_queue_key(song: string, difficulty: string): string
+	return string.lower(song) .. "|" .. string.lower(difficulty) --// lowercased so casing cant split players into different queues
 end
 
---// udim2 to pixels by hand, the root's AbsoluteSize already has the uiscale baked in and would count the zoom twice
-local function to_pixels(udim, parent_size)
-	return Vector2.new(udim.X.Scale * parent_size.X + udim.X.Offset, udim.Y.Scale * parent_size.Y + udim.Y.Offset)
+local function clear_queue(player: Player)
+	local key = player_queue_key[player]
+	if key and queue[key] == player then queue[key] = nil end --// the slot may already belong to someone else by now
+	player_queue_key[player] = nil
 end
 
---// camera actions
-
-local function zoom_camera(v)
-	if type(v) ~= "table" then return end --// bad chart data (like a plain number) just gets ignored
-	local duration = v.duration or 0
-	if duration <= 0 then
-		tracks.base_zoom:snap(v.zoom or 1)
-	else
-		tracks.base_zoom:animate(v.zoom or 1, song_time_ms, duration, parse_ease(v.ease))
-	end
+local function end_match(player: Player)
+	local opponent = active_matches[player]
+	if not opponent then return end
+	active_matches[player] = nil
+	active_matches[opponent] = nil --// both sides go together so presses stop relaying either way
+	if opponent.Parent then pvp_remote:FireClient(opponent, {a = "OpponentLeft"}) end
 end
 
-local function set_camera_bop(v)
-	if type(v) ~= "table" then return end
-	if v.intensity ~= nil then bop_intensity = v.intensity end --// only touch what the event actually sent
-	if v.rate ~= nil then bop_rate = math.max(v.rate, 1) end
+--// charts
+
+local function load_charts(song: string): {[string]: any}?
+	local song_module = SongCatalog.FindSongModule(song)
+	if not song_module then return nil end
+	local success, data = pcall(require, song_module) --// pcall because one broken song module shouldnt error the whole handler
+	if not success or typeof(data) ~= "table" or typeof(data.Charts) ~= "table" then return nil end
+	return data.Charts
 end
 
---// seconds until the next focus event, nil when there isnt one
-local function seconds_to_next_focus(step)
-	for i = step + 1, #events do --// look ahead for focus events only, other types dont matter here
-		if events[i].e == "FocusCamera" then return (events[i].t - events[step].t) / 1000 end --// ms to seconds
+--// one place decides what is playable so the queue, party picks and the random fallback cant disagree
+local function get_pvp_chart(song: any, difficulty: any): {any}?
+	if typeof(song) ~= "string" or typeof(difficulty) ~= "string" then return nil end --// this is client input, string.lower would happily take a number
+	local charts = load_charts(song)
+	if not charts then return nil end
+	for chart_difficulty, chart in charts do
+		if string.lower(chart_difficulty) == string.lower(difficulty) then --// clients can send any casing
+			return if SongCatalog.IsSoloOnly(song, difficulty) then nil else chart
+		end
 	end
 	return nil
 end
 
-local function focus_camera(value, step)
-	local v = if type(value) == "table" then value elseif type(value) == "number" then { char = value } else {} --// a number is the shorthand event (just the char), junk falls back to defaults
-	local char = v.char or 0 --// no char means player
-	local target = focus_targets[char]
-	if target == nil then warn(string.format("CameraHandle: no FocusPoints marker for char=%s - ignoring FocusCamera.", tostring(char))); return end --// warn not error, one bad event shouldnt kill the song
-
-	local goals = { --// where every focus track is heading
-		focus_point = get_local_fraction(target),
-		focus_offset = Vector2.new(focus_anchor.X.Offset + (v.x or 0), focus_anchor.Y.Offset + (v.y or 0)), --// x and y in the event push the camera off the marker a bit
-		focus_zoom = config.CameraFocusZoom or 1,
-	}
-
-	local raw_duration = v.duration or config.CameraDefaultPanDuration or 4 --// the event can override the default pan time
-	local snap = not has_focused or raw_duration <= 0 --// first focus and zero length pans jump straight there
-	has_focused = true
-
-	local duration = raw_duration / pan_speed_multiplier
-	local max_gap = seconds_to_next_focus(step)
-	if max_gap ~= nil then duration = math.min(duration, math.max(max_gap * 0.9, 0.05)) end --// 90% of the gap to the next focus so the pan ends before the next one starts, 0.05 floor so it never hits 0
-
-	local ease = parse_ease(v.ease or config.CameraDefaultPanEase)
-	for name, goal in goals do
-		if snap then tracks[name]:snap(goal) else tracks[name]:animate(goal, song_time_ms, duration, ease) end --// all of them share the duration and ease so the camera moves as one
-	end
-end
-
-local event_handlers = { --// every handler gets the event value and its index in the list
-	FocusCamera = focus_camera,
-	ZoomCamera = zoom_camera,
-	SetCameraBop = set_camera_bop,
-}
-
---// public api
-
-camera_handle.LoadEvents = function(new_events)
-	events = new_events or {} --// expects them sorted by time, Update reads them in order
-	event_step = 1
-end
-
-camera_handle.SetPanSpeedMultiplier = function(multiplier)
-	pan_speed_multiplier = math.max(multiplier, 0.01) --// floor so it never divides by 0
-end
-
-camera_handle.SetScaleClamp = function(min_value, max_value)
-	min_scale = math.min(min_value, max_value) --// min and max so passing them swapped doesnt break the clamp
-	max_scale = math.max(min_value, max_value)
-end
-
-camera_handle.SetBPM = set_bpm
-
-camera_handle.Update = function(time_ms)
-	song_time_ms = time_ms --// set first, the actions below read it for their start time
-
-	local event = events[event_step]
-	while event and time_ms >= event.t do --// while and not if cus more than one event can land on the same frame
-		local handler = event_handlers[event.e]
-		if handler then
-			handler(event.v, event_step)
-		else
-			warn(string.format("CameraHandle: unknown event type '%s' at t=%s", tostring(event.e), tostring(event.t))) --// misspelled event names show up in output instead of silently doing nothing
+local function get_random_song_pick(): (string?, string?, {any}?)
+	local candidates: {string} = {}
+	for _, song_module in ipairs(SongCatalog.Get()) do
+		for _, song in ipairs(song_module.Songs) do
+			if not SongCatalog.HasAnySoloRestriction(song) then table.insert(candidates, song) end
 		end
-		event_step += 1 --// moving the step forward is what stops an event from running twice
-		event = events[event_step]
 	end
-
-	for _, value_track in tracks do value_track:step(time_ms) end --// every track moves itself and clears its anim once its done
-
-	local total_scale = math.clamp(tracks.base_zoom.value * tracks.focus_zoom.value + evaluate_bump(time_ms), min_scale, max_scale) --// the zooms multiply but the bump adds on top so its the same size at any zoom
-	scale.Scale = total_scale
-
-	local parent_size = main_ui.AbsoluteSize
-	local anchor_px = to_pixels(focus_anchor, parent_size) --// where the focus should land on screen in pixels
-	local base_size_px = to_pixels(camera_root.Size, parent_size)
-	local position = anchor_px - tracks.focus_point.value * total_scale * base_size_px + tracks.focus_offset.value --// fraction times the scaled size is how far into the root the focus point is, subtract it so that point ends up on the anchor
-	camera_root.Position = UDim2.fromOffset(position.X, position.Y) --// offset only cus everything above is already pixels
+	if #candidates == 0 then return nil, nil, nil end
+	local song = candidates[math.random(1, #candidates)]
+	local charts = load_charts(song)
+	if not charts then return nil, nil, nil end
+	local difficulties: {string} = {}
+	for difficulty in charts do
+		if not SongCatalog.IsSoloOnly(song, difficulty) then table.insert(difficulties, difficulty) end
+	end
+	if #difficulties == 0 then return nil, nil, nil end
+	local difficulty = difficulties[math.random(1, #difficulties)]
+	return song, difficulty, get_pvp_chart(song, difficulty)
 end
 
-camera_handle.Reset = function()
-	events, event_step = {}, 1
-	has_focused = false --// so the next song snaps to its first focus again
-	for name, value in start_values do tracks[name]:snap(value) end
-
-	last_beat_index, bump_start_ms = -1, -1e9
-	song_time_ms = 0
-	bop_intensity, bop_rate = 1, base_bump_every
-
-	camera_root.Position = base_position --// back to where it started
-	scale.Scale = 1
+local function get_min_duration(chart: {any}): number
+	local last_note_end = 0
+	for _, note in ipairs(chart) do
+		last_note_end = math.max(last_note_end, note.t + (if typeof(note.d) == "number" then note.d else 0)) --// d is an optional length added on top of the note time
+	end
+	return math.max(last_note_end / 1000 * 0.85, min_match_duration_seconds) --// note times are in ms, the floor is 85% of the last note time but never under the minimum
 end
 
-return camera_handle
+--// results
+
+local function record_win(winner: Player, loser: Player)
+	local winner_stats, loser_stats = load_stats(winner.UserId), load_stats(loser.UserId) --// these can yield on a cold cache
+	winner_stats.Wins += 1
+	winner_stats.Streak += 1
+	winner_stats.BestStreak = math.max(winner_stats.BestStreak, winner_stats.Streak)
+	loser_stats.Losses += 1
+	loser_stats.Streak = 0 --// a loss ends the streak, a draw leaves it alone
+	save_stats(winner.UserId, winner_stats)
+	save_stats(loser.UserId, loser_stats)
+	push_stats(winner, winner_stats)
+	push_stats(loser, loser_stats)
+end
+
+local function record_draw(first: Player, second: Player)
+	for _, player in {first, second} do
+		local stats = load_stats(player.UserId)
+		stats.Draws += 1
+		save_stats(player.UserId, stats)
+		push_stats(player, stats)
+	end
+end
+
+local function pick_winner(first: Player, second: Player, first_report: MatchReport, second_report: MatchReport): Player?
+	if first_report.forfeited and second_report.forfeited then return nil end --// both left, nobody gets the win
+	if first_report.forfeited then return second end --// the side that forfeited loses no matter what either score was
+	if second_report.forfeited then return first end
+	if first_report.score > second_report.score then return first end --// > both ways so an equal score falls through to a draw
+	if second_report.score > first_report.score then return second end
+	return nil
+end
+
+local function try_resolve_match(record: MatchRecord)
+	local first, second = record.players[1], record.players[2]
+	local first_report, second_report = record.reports[first], record.reports[second]
+	if not first_report or not second_report then return end --// still waiting on the other side
+	player_match[first] = nil --// cleared before record_win because that can yield, a late report must find no match and cant resolve it twice
+	player_match[second] = nil
+	local winner = pick_winner(first, second, first_report, second_report)
+	if winner == nil then
+		record_draw(first, second)
+	else
+		record_win(winner, if winner == first then second else first)
+	end
+end
+
+local function forfeit_match(player: Player)
+	local record = player_match[player]
+	if not record or record.reports[player] then return end --// no match, or they already reported so leaving costs nothing
+	record.reports[player] = {score = 0, accuracy = 0, forfeited = true} --// the flag decides the result, the score is never compared
+	try_resolve_match(record)
+end
+
+--// matches and parties
+
+local function role_for_side(side: string): string
+	return if side == "Right" then "Player" else "Opponent"
+end
+
+local function opposite_role(role: string): string
+	return if role == "Player" then "Opponent" else "Player"
+end
+
+local function announce_match(player: Player, role: string, opponent: Player, song: string, difficulty: string, match_id: string)
+	pvp_remote:FireClient(player, {a = "Matched", role = role, opponent = opponent.Name, song = song, difficulty = difficulty, countdown = countdown_seconds, matchId = match_id})
+end
+
+--// the queue and the party pick both end up here so a match is set up the same way from either
+local function start_match(match_id: string, first: Player, first_role: string, second: Player, song: string, difficulty: string, chart: {any})
+	local record: MatchRecord = {id = match_id, players = {first, second}, start_time = os.clock(), min_duration = get_min_duration(chart), reports = {}}
+	player_match[first] = record
+	player_match[second] = record
+	active_matches[first] = second
+	active_matches[second] = first
+	announce_match(first, first_role, second, song, difficulty, match_id)
+	announce_match(second, opposite_role(first_role), first, song, difficulty, match_id)
+end
+
+--// a player already queued, matched or in a party cant start another of those
+local function is_busy(player: Player): boolean
+	return active_matches[player] ~= nil or player_match[player] ~= nil or player_party_id[player] ~= nil
+end
+
+local function is_open_for(record: PartyRecord, viewer: Player): boolean
+	return record.match_id == nil and record.joinable == "Everyone" and record.owner.Parent ~= nil and record.owner ~= viewer --// a viewer never sees their own party as joinable
+end
+
+local function build_open_party_list(viewer: Player): {any}
+	local list = {}
+	for _, record in parties do
+		if is_open_for(record, viewer) then
+			table.insert(list, {
+				Id = record.id,
+				PartyName = `{record.owner.Name} Party`,
+				Side = record.side,
+				Joinable = record.joinable,
+				WinCondition = record.win_condition,
+				RankedBy = record.win_condition,
+			})
+		end
+	end
+	return list
+end
+
+local function broadcast_party_list()
+	for _, player in players:GetPlayers() do
+		pvp_remote:FireClient(player, {a = "PartyListUpdated", parties = build_open_party_list(player)}) --// built per player because each one has their own party left out
+	end
+end
+
+local function cleanup_party_state(player: Player)
+	local party_id = player_party_id[player]
+	local record = if party_id then parties[party_id] else nil
+	player_party_id[player] = nil
+	if not record then return end
+	parties[record.id] = nil
+	local match_id = record.match_id
+	if not match_id then
+		broadcast_party_list() --// an open party vanished so every list is stale
+		return
+	end
+	pick_states[match_id] = nil --// the pick timer still fires later but finds nothing
+	for _, member in record.members do
+		if member == player then continue end
+		player_party_id[member] = nil
+		if member.Parent then pvp_remote:FireClient(member, {a = "OpponentLeft"}) end
+	end
+end
+
+--// the picked song only counts if it is still playable, and the match needs its chart anyway, otherwise random
+local function choose_party_song(pick: SongPick?): (string?, string?, {any}?)
+	if pick then
+		local chart = get_pvp_chart(pick.song, pick.difficulty)
+		if chart then return pick.song, pick.difficulty, chart end
+	end
+	return get_random_song_pick()
+end
+
+local function resolve_party_pick(match_id: string)
+	local pick_state = pick_states[match_id]
+	if not pick_state then return end --// someone left before the timer ran and cleanup already took it
+	pick_states[match_id] = nil
+	local record = pick_state.record
+	parties[record.id] = nil
+	local owner, joiner = record.members[1], record.members[2]
+	player_party_id[owner] = nil --// the party is over from here whether or not a match starts
+	player_party_id[joiner] = nil
+	if not owner.Parent or not joiner.Parent then return end
+	local chosen = record.members[math.random(1, 2)] --// only one of the two picks gets played
+	local song, difficulty, chart = choose_party_song(pick_state.picks[chosen])
+	if not song or not difficulty or not chart then
+		for _, member in {owner, joiner} do
+			if member.Parent then pvp_remote:FireClient(member, {a = "OpponentLeft"}) end --// nothing playable at all, so both get the same OpponentLeft a leaver would cause
+		end
+		return
+	end
+	start_match(match_id, owner, role_for_side(record.side), joiner, song, difficulty, chart)
+end
+
+local function announce_party_ready(player: Player, role: string, opponent: Player, match_id: string)
+	pvp_remote:FireClient(player, {a = "PartyReady", role = role, opponent = opponent.Name, matchId = match_id, pickSeconds = pick_seconds})
+end
+
+--// dying only backs out of things that arent locked in yet
+local function handle_reset(player: Player)
+	if player_match[player] or active_matches[player] then return end
+	clear_queue(player)
+	local party_id = player_party_id[player]
+	local record = if party_id then parties[party_id] else nil
+	if record and record.match_id == nil then cleanup_party_state(player) end --// a full party is already in its pick window so it is left alone
+end
+
+local function hook_character(player: Player, character: Model)
+	local humanoid = character:WaitForChild("Humanoid", 10) :: Humanoid?
+	if not humanoid then return end
+	humanoid.Died:Connect(function() handle_reset(player) end)
+end
+
+--// actions, every handler gets the player and the raw payload, anything in it can be junk since it came from a client
+--// party and match ids arent typeof checked, a wrong typed id never indexes or equals anything real
+
+local handlers: {[string]: (Player, any) -> ()} = {}
+
+handlers.Queue = function(player: Player, payload: any)
+	if active_matches[player] then return end
+	local song, difficulty = payload.song, payload.difficulty
+	local chart = get_pvp_chart(song, difficulty)
+	if not chart then return end
+	clear_queue(player) --// one slot per player, and it frees their own old slot so they cant match themselves
+	local key = make_queue_key(song, difficulty)
+	local waiting = queue[key]
+	if waiting and waiting.Parent then
+		queue[key] = nil
+		player_queue_key[waiting] = nil
+		start_match(http_service:GenerateGUID(false), waiting, "Player", player, song, difficulty, chart) --// whoever waited first is the Player
+	else
+		queue[key] = player --// also covers a waiter that left without clearing, their stale entry gets replaced
+		player_queue_key[player] = key
+		pvp_remote:FireClient(player, {a = "Waiting", song = song, difficulty = difficulty})
+	end
+end
+
+handlers.Cancel = function(player: Player)
+	clear_queue(player)
+end
+
+handlers.EndMatch = function(player: Player)
+	forfeit_match(player) --// records the loss first, then end_match unlinks the pair and tells the opponent
+	end_match(player)
+end
+
+handlers.ReportResult = function(player: Player, payload: any)
+	local score, accuracy = payload.score, payload.accuracy
+	if typeof(score) ~= "number" or typeof(accuracy) ~= "number" then return end
+	local record = player_match[player]
+	if not record or record.id ~= payload.matchId then return end --// has to be the match this player is really in, and not decided yet
+	if record.reports[player] then return end --// first report counts, no resending
+	if os.clock() - record.start_time < record.min_duration then return end --// too early to be a real finish, this is what stops instant fake results
+	record.reports[player] = {score = math.clamp(score, 0, Config.MaxScore), accuracy = math.clamp(accuracy, 0, 100), forfeited = false}
+	try_resolve_match(record)
+end
+
+handlers.CreateParty = function(player: Player, payload: any)
+	if is_busy(player) then return end
+	local side, joinable, win_condition = payload.side, payload.joinable, payload.winCondition
+	if not (valid_sides[side] and valid_joinable[joinable] and valid_win_conditions[win_condition]) then return end --// the whitelists double as type checks
+	local party_id = http_service:GenerateGUID(false)
+	parties[party_id] = {id = party_id, owner = player, members = {player}, side = side, joinable = joinable, win_condition = win_condition}
+	player_party_id[player] = party_id
+	if joinable == "Everyone" then broadcast_party_list() end
+end
+
+handlers.JoinParty = function(player: Player, payload: any)
+	if is_busy(player) then return end
+	local record = parties[payload.partyId]
+	if not record or not is_open_for(record, player) then return end
+	local match_id = http_service:GenerateGUID(false)
+	table.insert(record.members, player)
+	record.match_id = match_id --// this is the lock, from here is_open_for is false and the party drops out of every list
+	player_party_id[player] = record.id
+	pick_states[match_id] = {record = record, picks = {}}
+	broadcast_party_list()
+	local owner_role = role_for_side(record.side)
+	announce_party_ready(record.owner, owner_role, player, match_id)
+	announce_party_ready(player, opposite_role(owner_role), record.owner, match_id)
+	task.delay(pick_seconds, resolve_party_pick, match_id) --// the pick window ends here whether or not anyone picked
+end
+
+handlers.LeaveParty = function(player: Player)
+	cleanup_party_state(player)
+end
+
+handlers.RequestPartyList = function(player: Player)
+	pvp_remote:FireClient(player, {a = "PartyListUpdated", parties = build_open_party_list(player)})
+end
+
+handlers.PickSong = function(player: Player, payload: any)
+	local pick_state = pick_states[payload.matchId]
+	if not pick_state or not table.find(pick_state.record.members, player) then return end
+	if not get_pvp_chart(payload.song, payload.difficulty) then return end
+	pick_state.picks[player] = {song = payload.song, difficulty = payload.difficulty} --// last pick wins, and only one of the two picks is used later
+end
+
+--// connections
+
+pvp_remote.OnServerEvent:Connect(function(player: Player, payload: any)
+	if typeof(payload) ~= "table" or typeof(payload.a) ~= "string" then return end
+	if is_rate_limited(action_counts, player, max_actions_per_second) then return end
+	local handler = handlers[payload.a]
+	if handler then handler(player, payload) end
+end)
+
+press_relay.OnServerEvent:Connect(function(player: Player, events: any)
+	if typeof(events) ~= "table" or #events > max_events_per_batch then return end
+	if is_rate_limited(batch_counts, player, max_batches_per_second) then return end
+	local opponent = active_matches[player]
+	if not opponent or not opponent.Parent then return end
+	local sanitized = {}
+	for _, event: any in ipairs(events) do --// ipairs walks only the array part, the same part the size cap above counted
+		if typeof(event) == "table" and (event.t == "press" or event.t == "release") and valid_directions[event.d] then
+			table.insert(sanitized, {t = event.t, d = event.d}) --// rebuilt with just t and d so a client cant push extra fields to the opponent
+		end
+	end
+	if #sanitized == 0 then return end
+	press_relay:FireClient(opponent, sanitized)
+end)
+
+pvp_stats_function.OnServerInvoke = function(player: Player)
+	return load_stats(player.UserId)
+end
+
+players.PlayerAdded:Connect(function(player: Player)
+	create_leaderstats(player)
+	task.spawn(function() sync_leaderstats(player, load_stats(player.UserId)) end) --// spawned so the datastore read doesnt hold up the character hooks below
+	player.CharacterAdded:Connect(function(character) hook_character(player, character) end)
+	if player.Character then hook_character(player, player.Character) end
+end)
+
+players.PlayerRemoving:Connect(function(player: Player)
+	batch_counts[player] = nil
+	action_counts[player] = nil
+	stats_cache[player.UserId] = nil
+	player_leaderstats[player] = nil
+	clear_queue(player)
+	cleanup_party_state(player)
+	forfeit_match(player)
+	end_match(player)
+end)
