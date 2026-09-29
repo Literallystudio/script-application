@@ -1,626 +1,726 @@
---// Services
+--// modules
 
-local replicated = game.ReplicatedStorage
-local server_storage = game.ServerStorage
+local Proxy = require(script.Proxy) --// wraps the class for every field (read or write)
+local Signal = require(script.Signal) --// custom signal, tells me how many listeners are connected
+local SynchronousTaskManager = require(script.SynchronousTaskManager) --// basically a queue that runs in a different thread
 
-local http = game:GetService("HttpService")
-local tween = game:GetService("TweenService")
+--// services
+
+local data_store_service = game:GetService("DataStoreService")
+local memory_store_service = game:GetService("MemoryStoreService")
+local http_service = game:GetService("HttpService")
 local run_service = game:GetService("RunService")
 
---// Directories
+--// state
 
-local m_rng = require("@game/ReplicatedStorage/Modules/Shared/RNG")
-local rng = m_rng.new(DateTime.fromUniversalTime(DateTime.fromUniversalTime():ToUniversalTime().Year - math.random(3, 6)).UnixTimestamp)
+local data_stores = {} --// id to store, so calling new twice on one key gives the same store back
+local bind_to_close = {} --// stores that btc (duh)
+local active = true --// goes false at shutdown so late stores dont sign up for a save that already happened
 
-local plant_assets = server_storage.PlantAssets
+local alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!$%&',./:;=?@[]^_`{}~" --// the digits for my number encoding, dont reorder or old saves break
+local base = #alphabet
+local bytes = {} --// char code to digit value, decode needs this to go backwards
+for i = 1, base do bytes[string.byte(alphabet, i)] = i - 1 end
 
-local plants = plant_assets.Plants
-local crops = plant_assets.Crops
+local end_mark = "\0" --// marks the end of a string or table in the compressed text
+local type_pattern = "([-+<>()#|*\0])" --// finds the next marker while reading compressed text
+local digit_pattern = "([^-+<>()#|*\0]*)" --// grabs the digits after a number marker
+local number_signs = {["<"] = -1, [">"] = 1, ["("] = -1, [")"] = 1} --// marker to sign round brackets mean it had decimals
 
-local seed_data = require(plant_assets.SeedData)
+local data_store_class = {} --// all the methods and stuff blah vlah blah
+local constructor = {} --// what other scripts get (new, hidden an find)
 
-local m_vfx = replicated.Assets.MutationVFX
+--// these call each other so they get declared here and filled in later
+local open_task, read_task, lock_task, save_task, close_task, destroy_task
 
---// Types
+--// types
 
-export type mutation = {
-	id : string,
-	multiplier : number
+export type Constructor = {
+	new: (name: string, scope: string, key: string?) -> DataStore,
+	hidden: (name: string, scope: string, key: string?) -> DataStore,
+	find: (name: string, scope: string, key: string?) -> DataStore?,
+	Response: {Success: string, Saved: string, Locked: string, State: string, Error: string},
 }
 
-export type crop = {
-	point : number,
-	size : number,
-	variant_id : number,
-	growth_progress : number,
-	max_progress : number,
-	mutations : {mutation}
+export type DataStore = {
+	[any]: any,
+	Value: any,
+	Metadata: {[string]: any},
+	UserIds: {any},
+	SaveInterval: number,
+	SaveDelay: number,
+	LockInterval: number,
+	LockAttempts: number,
+	SaveOnClose: boolean,
+	Id: string,
+	UniqueId: string,
+	Key: string,
+	State: boolean?,
+	Hidden: boolean,
+	AttemptsRemaining: number,
+	CreatedTime: number,
+	UpdatedTime: number,
+	Version: string,
+	CompressedValue: string,
+	StateChanged: Signal.Signal,
+	Saving: Signal.Signal,
+	Saved: Signal.Signal,
+	AttemptsChanged: Signal.Signal,
+	ProcessQueue: Signal.Signal,
+	Open: (self: DataStore, template: any?) -> (string, any),
+	Read: (self: DataStore, template: any?) -> (string, any),
+	Save: (self: DataStore) -> (string, any),
+	Close: (self: DataStore) -> (string, any),
+	Destroy: (self: DataStore) -> (string, any),
+	Queue: (self: DataStore, value: any, expiration: number?, priority: number?) -> (string, any),
+	Remove: (self: DataStore, id: string) -> (string, any),
+	Clone: (self: DataStore) -> any,
+	Reconcile: (self: DataStore, template: any) -> (),
+	Usage: (self: DataStore) -> (number, number),
 }
 
-export type plant = {
-	id : number,
-	variant_id : number,
-	size : number,
-	growth_progress : number,
-	max_progress : number,
-	crops : {crop}?,
-	cframe : string,
-	mutations : {mutation}?,
-}
+--// helpers
 
---// load & save
+local function clone(original)
+	if type(original) ~= "table" then return original end --// numbers and strings copy by themselves
+	local copy = {}
+	for index, value in original do copy[index] = clone(value) end --// go deep so nested tables arent shared
+	return copy
+end
 
-function load_plants(data : {plant}, folder : Folder, plot : Model)
-	for _, plant : plant in data do
-		local success, output = pcall(function()
-			local plant_variants = find_first_child_with_attribute_set_to(plants, "ID", plant.id)
-			if not plant_variants then warn("Attempted to load a plant with id", plant.id, "which doesn't exist.") return end
-
-			local plant_name = plant_variants.Name
-
-			local variant = find_first_child_with_attribute_set_to(plant_variants, "ID", plant.variant_id)
-			if not variant then
-				warn(plant_name, "variant with id:", plant.variant_id, "doesn't exist.")
-
-				local vars = plant_variants:GetChildren()
-				variant = vars[math.random(1, #vars)]
-
-				if not variant then
-					error(plant_name ..  " has no variants!")
-				end
-			end
-
-			local data = seed_data[plant_name]
-			if not data then error("Seed data with name " .. plant_name .. " does not exist.") return end
-
-			--
-
-			local p_clone = variant:Clone()
-
-			p_clone:SetAttribute("VariantID", variant:GetAttribute("ID"))
-			p_clone:SetAttribute("VariantName", variant.Name)
-			p_clone:SetAttribute("PlantID", plant.PlantID)
-
-			p_clone:SetAttribute("GrowthProgress", plant.growth_progress)
-			p_clone:SetAttribute("GrowthTime", plant.max_progress)
-
-			local cf = stringtocframe(plant.cframe)
-			if typeof(cf) ~= "CFrame" then
-				p_clone:Destroy()
-				warn("Invalid plant CFrame:", plant.cframe)
-			end
-			p_clone:PivotTo(plot:GetPivot():ToWorldSpace(cf))
-
-			check_visible_phases(p_clone, p_clone.Phases)
-
-			p_clone:SetAttribute("Size", plant.size)
-			p_clone:ScaleTo(plant.size)
-
-			p_clone.Name = plant_variants.Name
-			p_clone:AddTag("Plant")
-			p_clone.Parent = folder
-			
-			p_clone:SetAttribute("SoilName", find_plant_soil(p_clone))
-
-			if plant.mutations then
-				p_clone:SetAttribute("Mutations", http:JSONEncode(plant.mutations))
-				apply_mutation_effects(p_clone, plant.mutations)
-				
-				local connection = p_clone:GetAttributeChangedSignal("Mutations"):Connect(function()
-					apply_mutation_effects(p_clone, http:JSONDecode(p_clone:GetAttribute("Mutations")))
-				end)
-
-				p_clone.Destroying:Once(function()
-					connection:Disconnect()
-				end)
-
-				return true --// no need to check if plant has crops
-			end
-
-			variant = nil
-
-			if plant.crops then
-				local crop_variants = crops[plant_name]
-				if not crop_variants then 
-					warn("No crop variants for: ", plant_name)
-					return 
-				end
-
-				local cropfolder:Folder = nil
-
-				if not p_clone:FindFirstChild("Crops") then
-					cropfolder = Instance.new("Folder", p_clone)
-					cropfolder.Name = "Crops"
-				else
-					cropfolder = p_clone:FindFirstChild("Crops")
-				end
-
-				for _, crop : crop in plant.crops do
-					local variant = find_first_child_with_attribute_set_to(crop_variants, "ID", crop.variant_id)
-
-					if not variant then
-						warn(plant_name, "crop variant with id:", crop.variant_id, "doesn't exist.")
-
-						local vars = crop_variants:GetChildren()
-						variant = vars[math.random(1, #vars)]
-					end
-
-					local c_clone = variant:Clone()
-
-					c_clone:SetAttribute("VariantID", variant:GetAttribute("ID"))
-					c_clone:SetAttribute("VariantName", variant.Name)
-
-					c_clone:SetAttribute("GrowthProgress", crop.growth_progress)
-					c_clone:SetAttribute("GrowthTime", crop.max_progress)
-
-					c_clone:SetAttribute("Size", crop.size)
-					c_clone:ScaleTo(crop.size)
-
-					local crop_point:Part = p_clone.CropPoints:FindFirstChild(crop.PosNo)
-
-					c_clone:SetAttribute("Point", crop_point.Name)
-					crop_point:SetAttribute("Occupied", true)
-
-					c_clone:SetAttribute("Mutations", http:JSONEncode(crop.mutations))
-					apply_mutation_effects(c_clone, crop.mutations)
-
-					place_crop_at_point(c_clone, crop_point.CFrame)
-					task.spawn(function()
-						if c_clone.Parent and crop_point.Parent then
-							local cropPos = c_clone:GetPivot().Position
-							local pointPos = cropPos.Position
-
-							if (cropPos - pointPos).Magnitude > 0.01 then
-								place_crop_at_point(c_clone, crop_point.CFrame)
-							end
-						end
-					end)
-
-					check_visible_phases(crop, crop.Phases)
-
-					c_clone.Name = plant_name
-					c_clone.Parent = cropfolder
-				end
-			end
-			
-			return true
-		end)
-		
-		if not success or not output then
-			warn("Failed to load plant: ", output)
+local function reconcile(target, template)
+	for index, value in template do
+		if type(index) == "number" then continue end --// array slots are real data, leave them
+		if target[index] == nil then
+			target[index] = clone(value) --// missing key, hand it a fresh default
+		elseif type(target[index]) == "table" and type(value) == "table" then
+			reconcile(target[index], value) --// both are tables, check inside too
 		end
 	end
 end
 
-function export_plants(folder : Folder, plot : Model)
-	local tbl = {}
-	for _, plant : Model in folder:GetChildren() do
-		local success, mutations = pcall(function()
-			return http:JSONEncode(plant:GetAttribute("Mutations"))
-		end)
-		if not success then mutations = nil end
-		
-		local save : plant = {
-			id = plant:GetAttribute("PlantID"),
-			variant_id = plant:GetAttribute("VariantID"),
-			size = plant:GetAttribute("Size"),
-			max_progress = plant:GetAttribute("GrowthTime"),
-			growth_progress = plant:GetAttribute("GrowthProgress"),
-			mutations = mutations,
-			cframe = cframetostring(plot:GetPivot():ToObjectSpace(plant:GetPivot()))
-		}
-		
-		if plant:FindFirstChild("Crops") then
-			local crops : {crop} = {}
-			
-			for _, crop : Model in plant.Crops:GetChildren() do
-				table.insert(crops, {
-					variant_id = plant:GetAttribute("VariantID"),
-					size = plant:GetAttribute("Size"),
-					max_progress = plant:GetAttribute("GrowthTime"),
-					growth_progress = plant:GetAttribute("GrowthProgress"),
-					mutations = mutations,
-					point = crop:GetAttribute("Point")
-				})
-			end
-			
-			save.crops = crops	
-		end
-		
-		table.insert(tbl, save)
- 	end
-	return tbl
+--// apply template, leaves existing vals
+local function apply_template(public, template)
+	if public.Value == nil then
+		public.Value = clone(template)
+	elseif type(public.Value) == "table" and type(template) == "table" then
+		reconcile(public.Value, template)
+	end
 end
 
-function create_plant(name : string, c : CFrame, plot : Model) : boolean
-	--// Check variables
-	
-	if type(name) ~= "string" then error("Argument #1 invalid: name is not string:" .. tostring(name)) end
-	if typeof(c) ~= "CFrame" then error("Argument #2 is invalid: c is not a cframe " .. tostring(c)) end
-	if not plot or not plot.Parent or plot.Parent ~= workspace.Map.Plots then
-		error("Argument #3 is invalid: invalid plot")
+--// datastores fail randomly so try a few times with a 1 second wait between
+local function retry(attempts, fn)
+	local success, first, second
+	for i = 1, attempts do
+		if i > 1 then task.wait(1) end
+		success, first, second = pcall(fn)
+		if success then break end
 	end
-	
-	local data : seed_data.seed_data  = seed_data[name]
-	if not data then error("No seed data for: " .. name) end
-	
-	local variants = plants:FindFirstChild(name)
-	if not variants then error("No variants folder found for: " .. name) end
-	if #variants:GetChildren() < 1 then error("No models for plant: " .. name) end
-	
-	--// Get plant variant
-	
-	local weight_table = {}
-	for _, var in variants:GetChildren() do
-		if not var:IsA("Model") then continue end
-		
-		local w = var:GetAttribute("Weight")
-		if type(w) ~= "number" then continue end
-		
-		table.insert(weight_table, {
-			Chance = w,
-			Value = var
-		})
-	end
-	if #weight_table < 1 then error("No valid variants for plant: " .. name) end
-	
-	local model : Model = rng:PickWeighted(weight_table)
-	if typeof(model) ~= "Instance" then error("Unable to get a valid plant model for plant name: " .. name) end
-	
-	local plant = model:Clone()
-	
-	--// Setup Plant
-	
-	local growth_time = rng:NextInteger(data.growthTime.Min, data.growthTime.Max)
-	local sprout_time = rng:NextInteger(data.sproutTime.Min, data.sproutTime.Max)
-	
-	plant:SetAttribute("GrowthProgress", 0 - sprout_time)
-	plant:SetAttribute("GrowthTime", growth_time)
-	
-	plant:SetAttribute("PlantID", variants:GetAttribute("ID"))
-	plant:SetAttribute("VariantID", model:GetAttribute("ID"))
-	plant:SetAttribute("ID", nil)
-	
-	plant:SetAttribute("SoilName", find_plant_soil(plant))
-	
-	if not data.crop_data then
-		plant:SetAttribute("Mutations", http:JSONEncode({}))
-		
-		local connection = plant:GetAttributeChangedSignal("Mutations"):Connect(function()
-			apply_mutation_effects(plant, http:JSONDecode(plant:GetAttribute("Mutations")))
-		end)
-		
-		plant.Destroying:Once(function()
-			connection:Disconnect()
-		end)
+	return success, first, second
+end
+
+--// check up on every thread that was waiting on a task
+local function resume_all(running, ...)
+	for thread in running:Iterate() do task.defer(thread, ...) end
+end
+
+--// close and destroy only say Saved if a save really happened
+local function resume_saved(running, response, response_data)
+	if response == "Saved" then
+		resume_all(running, response, response_data)
 	else
-		plant:AddTag("Tree")
-		local crops = Instance.new("Folder", plant)
-		crops.Name = "Crops"
+		resume_all(running, "Success")
 	end
-	
-	check_visible_phases(plant, plant.Phases)
-	plant:PivotTo(c)
-	
-	plant.Name = name
-	plant.Parent = plot.Plants
-	
-	--
-	
-	local sprout_part = Instance.new("Part")
-	sprout_part.Shape = Enum.PartType.Cylinder
-	sprout_part.Color = Color3.fromRGB(77,64,54)
-	sprout_part.Size = Vector3.new(0,1.359,0)
-	sprout_part.CFrame = c
-	sprout_part.Parent = workspace.Runtime.Temporary
-	
-	game.TweenService:Create(sprout_part, TweenInfo.new(0.6, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {
-		Size = Vector3.new(0.148, 1.359, 2)
-	}):Play()
-	
-	grow_plant(plant, plot)
-	
-	task.spawn(function()
-		repeat
-			task.wait()
-		until plant:GetAttribute("GrowthProgress") > 0 or not (plant and plant.Parent)
-		
-		if not plant.Parent or not plant then 
-			sprout_part:Destroy()
-			return 
-		end
-		
-		local tween = game.TweenService:Create(sprout_part, TweenInfo.new(1), {
-			Transparency = 1
-		})
-		
-		tween:Play()
-		tween.Completed:Wait()
-		
-		if sprout_part and sprout_part.Parent then sprout_part:Destroy() end
-	end)
-	
-	return true
 end
 
-
---// Mutations
-
-function apply_mutation_effects(model : Model, mutations : {mutation})
-	local mutations_part : Part = model:FindFirstChild("Mutations")
-	
-	if not mutations_part then
-		mutations_part = Instance.new("Part", model)
-		local weld = Instance.new("WeldConstraint", mutations_part)
-		
-		mutations_part.Name = "Mutations"
-		mutations_part.Size = Vector3.new(3,3,3)
-		mutations_part.Transparency = 1
-
-		mutations_part.CanCollide = false
-		mutations_part.CanQuery = false
-		mutations_part.AudioCanCollide = false
-		mutations_part.CanTouch = false
-		
-		--// Weld the mutation part to a random part of the model incase if the model is a tool
-		local random_part : Part
-		for _, idk in model:GetDescendants() do
-			if idk:IsA("Part") or idk:IsA("UnionOperation") or idk:IsA("MeshPart") then
-				random_part = idk
-			end
-		end
-		
-		mutations_part.CFrame = model:GetBoundingBox()
-		weld.Part0 = random_part
-		weld.Part1 = mutations_part
-	end
-	
-	for _, m : mutation in mutations do
-		local effect = m_vfx:FindFirstChild(m.id)
-		if not effect then continue end
-		
-		if mutations_part:FindFirstChild(effect.Name) then continue end
-		
-		effect:Clone().Parent = mutations_part
-	end
-	
+--// true if a close or destroy is waiting in line, timers should stay off then
+local function is_closing(internal)
+	return internal.task_manager:FindLast(close_task) ~= nil or internal.task_manager:FindLast(destroy_task) ~= nil
 end
 
---// Important Functions
+--// make sure you really passed a datastore
+local function get_internal(proxy, action)
+	local internal = getmetatable(proxy)
+	if type(internal) ~= "table" or internal.__shared ~= data_store_class.__shared then
+		error("Attempt to " .. action .. " failed: Passed value is not a DataStore", 3) --// 3 blames whoever called the method
+	end
+	return internal
+end
 
-function check_visible_phases(plant : Model, phases : Folder)
-	if not phases or phases.Parent then return end
-	local phase_amount = plant:GetAttribute("GrowthTime") / #phases:GetChildren()
-	
-	for _, phase in phases:GetChildren() do
-		local p_no = tonumber((string.gsub(phase.Name, "%D", "")))
-		local i_reached_this_phase = plant:GetAttribute("GrowthProgress") >= (phase_amount * p_no)
-		
-		if i_reached_this_phase then
-			if not plant:GetAttribute("Shown") then
-				if not phase:GetAttribute("Shown") then
-					phase:SetAttribute("Shown", true)
+--// compression, squishes data into a short string so more fits in the size limit
 
-					for _, part in phase:GetDescendants() do
-						if not part:IsA("Part") and not part:IsA("MeshPart") then continue end
+local function encode(value)
+	if value == 0 then return "0" end
+	local digits = {}
+	while value > 0 do
+		local digit = value % base
+		table.insert(digits, alphabet:sub(digit + 1, digit + 1)) --// lowest digit goes first
+		value = math.floor(value / base)
+	end
+	return table.concat(digits)
+end
 
-						local originalSize = part.Size part.Size = originalSize + Vector3.new(0.5,0.5,0.5)
-						game.TweenService:Create(part, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-							Size = originalSize
-						}):Play()
-					end
-				end
-			end
-			
-			for _, part in phase:GetDescendants() do
-				if not part:IsA("Part") and not part:IsA("MeshPart") then continue end
+local function decode(text)
+	local number, power = 0, 1
+	for _, code in {string.byte(text, 1, #text)} do
+		number += bytes[code] * power --// same order encode used
+		power *= base
+	end
+	return number
+end
 
-				if part:HasTag("DissapearAfter") and plant:GetAttribute("GrowthProgress") >= (phase_amount * p_no + 1) then
-					for _, part in phase:GetDescendants() do
-						if not part:IsA("Part") and not part:IsA("MeshPart") then continue end
+--// compress settings sit in the metadata so a store always unpacks the way it was packed
+local function compress_settings(metadata)
+	local settings = metadata.Compress
+	local safety = settings.Safety
+	if safety == nil then safety = true end
+	return settings.Level or 2, 10 ^ (settings.Decimals or 3), safety
+end
 
-						part.Transparency = 1
-						part.CanCollide = false
-
-						if #part:GetChildren() > 0 then
-							for _, maybedecal in part:GetChildren() do
-								if maybedecal:IsA("Decal") then
-									maybedecal.Transparency = 1
-								end
-							end
-						end
-
-					end
-
-				else
-					part.Transparency = 0
-					part.CanCollide = true
-
-					if #part:GetChildren() > 0 then
-						for _, maybedecal in part:GetChildren() do
-							if maybedecal:IsA("Decal") then
-								maybedecal.Transparency = 0
-							end
-						end
-					end
-				end
-			end
+local function compress(value, level, decimals, safety)
+	local data = {}
+	if type(value) == "boolean" then
+		table.insert(data, if value then "+" else "-")
+	elseif type(value) == "number" then
+		if value % 1 == 0 then
+			table.insert(data, if value < 0 then "<" .. encode(-value) else ">" .. encode(value)) --// whole numbers
 		else
-			if phase:GetAttribute("Hidden") then continue end
-			
-			phases:SetAttribute("Hidden", true)
-			for _, part in phase:GetDescendants() do
-				if not part:IsA("Part") and not part:IsA("MeshPart") then continue end
-				part.Transparency = 1
-				part.CanCollide = false
-
-				if #part:GetChildren() > 0 then
-					for _, maybedecal in part:GetChildren() do
-						if maybedecal:IsA("Decal") then
-							maybedecal.Transparency = 1
-						end
-					end
-				end
-			end
- 		end
-	end
-end
-
-function grow_plant(plant : Model, plot : Model)
-	local f_soils = plot.Soils
-	local soil_name = plant:GetAttribute("SoilName")
-	
-	local growth_time = plant:GetAttribute("GrowthTime")
-	
-	local soil = f_soils:FindFirstChild(soil_name)
-	if not soil then
-		local plant_name = plant.Name
-		plant:Destroy()
-		error("No soil found for: " .. plant_name)
-	end
-	
-	local next_tick = tick() + 1
-	local working = false
-	local connection ; connection = run_service.Stepped:Connect(function()
-		if working then return end
-		working = true
-		
-		local progress = plant:GetAttribute("GrowthProgress")
-		
-		if progress >= growth_time then
-			connection:Disconnect()
-			connection = nil
-			
-			if plant:HasTag("Tree") then
-				
-				return
-			end
-			
-			local prox = script.HarvestProx:Clone()
-			prox.CFrame = plant:GetBoundingBox()
-			prox.Parent = plant
-			
-			return
+			table.insert(data, if value < 0 then "(" .. encode(math.round(-value * decimals)) else ")" .. encode(math.round(value * decimals))) --// decimals get stored as big whole numbers
 		end
-		
-		if tick() >= next_tick then
-			local soil_water_level = soil:GetAttribute("WaterLevel")
-			
-			local increment = 1 * soil_water_level
-			
-			plant:SetAttribute("GrowthProgress", progress + increment)
-			next_tick = tick() + 1
-			
-			check_visible_phases(plant, plant.Phases)
-		end
-		
-		working = false
-	end)
-	
-	plant.Destroying:Once(function()
-		if connection then
-			connection:Disconnect()
-		end
-	end)
-end
-
-
---// Other Functions
-
-function cframetostring(cframevalue)
-	if typeof(cframevalue) == "CFrame" then
-		return "CF:" .. table.concat({cframevalue:GetComponents()}, ",")
-	end
-	return cframevalue
-end
-
-function stringtocframe(stringvalue:string)
-	if type(stringvalue) == "string" then
-		local values = string.split(stringvalue, ",")
-		if values[1]:sub(1,3) == "CF:" then
-			values[1] = values[1]:sub(4)
+	elseif type(value) == "string" then
+		if safety then value = value:gsub(end_mark, " ") end --// a stray end mark inside would break the format
+		table.insert(data, "#" .. value .. end_mark)
+	elseif type(value) == "table" then
+		if #value > 0 and level == 2 then
+			table.insert(data, "|") --// real arrays skip their keys
+			for i = 1, #value do table.insert(data, compress(value[i], level, decimals, safety)) end
 		else
-			return stringvalue
+			table.insert(data, "*") --// dictionaries go key then value, over and over
+			for key, item in value do
+				table.insert(data, compress(key, level, decimals, safety))
+				table.insert(data, compress(item, level, decimals, safety))
+			end
 		end
-		for i = 1, #values do values[i] = tonumber(values[i]) end
-		if #values == 12 then
-			return CFrame.new(values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10], values[11], values[12])
-		end
+		table.insert(data, end_mark)
 	end
-	return stringvalue
+	return table.concat(data)
 end
 
-function find_first_child_with_attribute_set_to(instance : Folder? | any?, attribute : string, set_to : any)
-	for _, child in instance:GetChildren() do
-		if child:GetAttribute(attribute) == set_to then
-			return child
+--// gives back the value and where it stopped reading so the caller can keep going
+local function decompress(text, decimals, index)
+	local _, position, kind = text:find(type_pattern, index or 1)
+	if kind == "-" then return false, position end
+	if kind == "+" then return true, position end
+	local sign = number_signs[kind]
+	if sign ~= nil then
+		local _, stop, digits = text:find(digit_pattern, position + 1)
+		local number = sign * decode(digits)
+		if kind == "(" or kind == ")" then number /= decimals end --// undo the decimal scaling
+		return number, stop
+	elseif kind == "#" then
+		local _, stop, str = text:find("(.-)" .. end_mark, position + 1) --// read up to the first end mark
+		return str, stop
+	elseif kind == "|" then
+		local array = {}
+		while true do
+			local item
+			item, position = decompress(text, decimals, position + 1)
+			if item == nil then break end --// hit the end mark then break arraeyyy
+			table.insert(array, item)
+		end
+		return array, position
+	elseif kind == "*" then
+		local dictionary = {}
+		while true do
+			local key, item
+			key, position = decompress(text, decimals, position + 1)
+			if key == nil then break end
+			item, position = decompress(text, decimals, position + 1)
+			dictionary[key] = item
+		end
+		return dictionary, position
+	end
+	return nil, position --// end mark or nothing left
+end
+
+--// session lock and datastore
+
+--// grabs the "Id" (SPELT EXACTLY LIKE THAT) key in memorystore, this is what stops two servers saving over each other
+local function lock_session(internal, attempts)
+	local public = internal.__public
+	local lock_interval, lock_attempts = public.LockInterval, public.LockAttempts
+	local owner, lock_time
+	local success, value = retry(attempts, function()
+		lock_time = os.clock() --// time stamp every try
+		return internal.memory_store:UpdateAsync("Id", function(current)
+			owner = current
+			return if owner == nil or owner == public.UniqueId then public.UniqueId else nil end, lock_interval * lock_attempts + 30) --// returning nil means someone else has it
+	end)
+	if not success then return "Error", value end
+	if value == nil then return "Locked", owner end --// tell the caller who has it
+	internal.lock_time = lock_time + lock_interval * lock_attempts
+	internal.active_lock_interval = lock_interval
+	public.AttemptsRemaining = lock_attempts
+	return "Success"
+end
+
+--// gives the lock back (0 expiry means destroy)
+local function unlock_session(internal, attempts)
+	local public = internal.__public
+	local owner
+	local success, value = retry(attempts, function()
+		return internal.memory_store:UpdateAsync("Id", function(current)
+			owner = current
+			return if owner == public.UniqueId then public.UniqueId else nil end, 0) --// only release if owned
+	end)
+	if not success then return "Error", value end
+	if value == nil and owner ~= nil then return "Locked", owner end
+	return "Success"
+end
+
+local function load_data(internal, attempts)
+	local public = internal.__public
+	local success, value, info = retry(attempts, function() return internal.data_store:GetAsync(public.Key) end)
+	if not success then return "Error", value end
+	if info == nil then
+		public.Metadata, public.UserIds, public.CreatedTime, public.UpdatedTime, public.Version = {}, {}, 0, 0, "" --// new key = nothing saved yet
+	else
+		public.Metadata, public.UserIds, public.CreatedTime, public.UpdatedTime, public.Version = info:GetMetadata(), info:GetUserIds(), info.CreatedTime, info.UpdatedTime, info.Version
+	end
+	if type(public.Metadata.Compress) == "table" then
+		public.CompressedValue = value
+		local _, decimals = compress_settings(public.Metadata)
+		public.Value = decompress(value, decimals) --// decompress also returns a position, we only want the value
+	else
+		public.Value = value
+	end
+	return "Success"
+end
+
+local function save_data(proxy, attempts)
+	local internal = getmetatable(proxy)
+	local public = internal.__public
+	local since_save = os.clock() - internal.save_time
+	if since_save < public.SaveDelay then task.wait(public.SaveDelay - since_save) end --// wait out the cooldown between saves
+	public.Saving:Fire(public.Value, proxy)
+	local success, value
+	if public.Value == nil then
+		success, value = retry(attempts, function() return internal.data_store:RemoveAsync(public.Key) end) --// nil value means delete the key
+		if success then public.Metadata, public.UserIds, public.CreatedTime, public.UpdatedTime, public.Version = {}, {}, 0, 0, "" end
+	else
+		local to_save = public.Value
+		if type(public.Metadata.Compress) == "table" then
+			local level, decimals, safety = compress_settings(public.Metadata)
+			public.CompressedValue = compress(public.Value, level, decimals, safety)
+			to_save = public.CompressedValue --// the string gets saved (not table)
+		end
+		internal.options:SetMetadata(public.Metadata)
+		success, value = retry(attempts, function() return internal.data_store:SetAsync(public.Key, to_save, public.UserIds, internal.options) end)
+		if success then public.Version = value end --// setasync hands back the new version id
+	end
+	if not success then
+		public.Saved:Fire("Error", value, proxy)
+		return "Error", value
+	end
+	internal.save_time = os.clock()
+	public.Saved:Fire("Saved", public.Value, proxy)
+	return "Saved", public.Value
+end
+
+--// timers, stop comes first so the others can use it
+
+local function stop_save_timer(internal)
+	if internal.save_thread == nil then return end
+	task.cancel(internal.save_thread)
+	internal.save_thread = nil
+end
+
+local function stop_lock_timer(internal)
+	if internal.lock_thread == nil then return end
+	task.cancel(internal.lock_thread)
+	internal.lock_thread = nil
+end
+
+local function save_timer_ended(proxy)
+	local internal = getmetatable(proxy)
+	internal.save_thread = nil
+	if internal.task_manager:FindLast(save_task) ~= nil then return end --// if already saving dont stack another save on
+	internal.task_manager:InsertBack(save_task, proxy)
+end
+
+local function lock_timer_ended(proxy)
+	local internal = getmetatable(proxy)
+	internal.lock_thread = nil
+	if internal.task_manager:FindFirst(lock_task) ~= nil then return end
+	internal.task_manager:InsertBack(lock_task, proxy)
+end
+
+local function start_save_timer(proxy)
+	local internal = getmetatable(proxy)
+	stop_save_timer(internal) --// never two timers at once
+	if internal.__public.SaveInterval == 0 then return end --// 0 means autosave is off
+	internal.save_thread = task.delay(internal.__public.SaveInterval, save_timer_ended, proxy)
+end
+
+local function start_lock_timer(proxy)
+	local internal = getmetatable(proxy)
+	stop_lock_timer(internal)
+	--// lock_time is when the whole lock runs out, so walk back by the attempts left to find when this round started
+	local start_time = internal.lock_time - internal.__public.AttemptsRemaining * internal.active_lock_interval
+	internal.lock_thread = task.delay(start_time - os.clock() + internal.active_lock_interval, lock_timer_ended, proxy)
+end
+
+--// lets other servers send this keys messages through memorystore (baiscally a waiting line queue thing)
+
+local function process_queue(proxy)
+	local internal = getmetatable(proxy)
+	local public = internal.__public
+	if public.State ~= true or public.ProcessQueue.Connections == 0 or internal.processing_queue then return end --// needs an open store + listener and ONE loop
+	internal.processing_queue = true
+	while true do
+		local success, values, id = pcall(internal.queue.ReadAsync, internal.queue, 100, false, 30) --// waits up to 30s for items
+		if public.State ~= true or public.ProcessQueue.Connections == 0 then break end
+		if success and id ~= nil then
+			public.ProcessQueue:Fire(id, values, proxy)
+		elseif not success then
+			task.wait(1) --// failed instantly wait to not cause server overload and die
 		end
 	end
-	
-	return nil
+	internal.processing_queue = false
 end
 
-function find_plant_soil(plant : Model)
-	local params = OverlapParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = {plant, plant.Parent}
-	
-	local position = plant:GetPivot().Position
-	
-	local parts = workspace:GetPartBoundsInBox(CFrame.new(position), Vector3.new(0.01,4,0.01), params)
-	
-	for _, part in parts do
-		if part:HasTag("Soil") then
-			return part.Name
+--// fires when someone connects to process_queue then listener starts loop
+local function signal_connected(connected, signal)
+	if connected == false then return end
+	process_queue(signal.DataStore)
+end
+
+--// task manager
+
+function open_task(running, proxy)
+	local internal = getmetatable(proxy)
+	local public = internal.__public
+	local response, response_data = lock_session(internal, 3)
+	if response ~= "Success" then return resume_all(running, response, response_data) end
+	response, response_data = load_data(internal, 3)
+	if response ~= "Success" then
+		unlock_session(internal, 3) --// got the lock but cant load so give it back so nobody gets stuck so so so so so so
+		return resume_all(running, response, response_data)
+	end
+	public.State = true
+	if not is_closing(internal) then
+		start_save_timer(proxy)
+		start_lock_timer(proxy)
+	end
+	for thread, template in running:Iterate() do
+		apply_template(public, template) --// apply template before resum
+		task.defer(thread, response)
+	end
+	if not internal.processing_queue and public.ProcessQueue.Connections > 0 then task.defer(process_queue, proxy) end
+	public.StateChanged:Fire(true, proxy)
+end
+
+function read_task(running, proxy)
+	local internal = getmetatable(proxy)
+	local public = internal.__public
+	if public.State == true then return resume_all(running, "State", "Open") end --// got opened while this waited in line
+	local response, response_data = load_data(internal, 3)
+	if response ~= "Success" then return resume_all(running, response, response_data) end
+	for thread, template in running:Iterate() do
+		apply_template(public, template)
+		task.defer(thread, response)
+	end
+end
+
+--// runs every lock intervul to keep the lock (too many failes closes store)
+function lock_task(running, proxy)
+	local internal = getmetatable(proxy)
+	local public = internal.__public
+	local before = public.AttemptsRemaining
+	local response, response_data = lock_session(internal, 3)
+	if response ~= "Success" then public.AttemptsRemaining -= 1 end
+	if public.AttemptsRemaining ~= before then public.AttemptsChanged:Fire(public.AttemptsRemaining, proxy) end
+	if public.AttemptsRemaining > 0 then
+		if not is_closing(internal) then start_lock_timer(proxy) end
+	else
+		public.State = false --// another server probably has the key
+		stop_lock_timer(internal)
+		stop_save_timer(internal)
+		if public.SaveOnClose then save_data(proxy, 3) end
+		unlock_session(internal, 3)
+		public.StateChanged:Fire(false, proxy)
+	end
+	resume_all(running, response, response_data)
+end
+
+function save_task(running, proxy)
+	local internal = getmetatable(proxy)
+	if internal.__public.State == false then return resume_all(running, "State", "Closed") end
+	stop_save_timer(internal)
+	running:End() --// new task instead of editing one thats mid-saev
+	local response, response_data = save_data(proxy, 3)
+	if not is_closing(internal) then start_save_timer(proxy) end
+	resume_all(running, response, response_data)
+end
+
+function close_task(running, proxy)
+	local internal = getmetatable(proxy)
+	local public = internal.__public
+	if public.State == false then return resume_all(running, "Success") end
+	public.State = false --// close before saving
+	local response, response_data
+	if public.SaveOnClose then response, response_data = save_data(proxy, 3) end
+	unlock_session(internal, 3)
+	public.StateChanged:Fire(false, proxy)
+	resume_saved(running, response, response_data)
+end
+
+function destroy_task(running, proxy)
+	local internal = getmetatable(proxy)
+	local public = internal.__public
+	local was_open = public.State ~= false
+	public.State = nil --// nil means its gone, false means closed
+	local response, response_data
+	if was_open then
+		if public.SaveOnClose then response, response_data = save_data(proxy, 3) end
+		unlock_session(internal, 3)
+	end
+	public.StateChanged:Fire(nil, proxy)
+	for _, name in {"StateChanged", "Saving", "Saved", "AttemptsChanged", "ProcessQueue"} do
+		public[name]:DisconnectAll() --// stop listeners so nothing leaks
+	end
+	bind_to_close[public.UniqueId] = nil
+	resume_saved(running, response, response_data)
+end
+
+--// class
+
+data_store_class.__tostring = function()
+	return "DataStore"
+end
+
+data_store_class.__shared = {
+	Open = function(proxy, template)
+		local internal = get_internal(proxy, "Open")
+		local public, tasks = internal.__public, internal.task_manager
+		if public.State == nil then return "State", "Destroyed" end
+		local pending = tasks:FindFirst(open_task)
+		if pending ~= nil then return pending:Wait(template) end --// open already running so just hop on it
+		if tasks:FindLast(destroy_task) ~= nil then return "State", "Destroying" end
+		if public.State == true and tasks:FindLast(close_task) == nil then
+			apply_template(public, template) --// open = fill in the template
+			return "Success"
 		end
-	end
-	
-	return nil
-end
-
-local function cropGeometryCentre(crop: Model): Vector3?
-	local min, max
-
-	for _, part in ipairs(crop:GetDescendants()) do
-		if part:IsA("BasePart") then
-			local cf, size = part.CFrame, part.Size
-			local half = Vector3.new(
-				math.abs(cf.RightVector.X) * size.X + math.abs(cf.UpVector.X) * size.Y + math.abs(cf.LookVector.X) * size.Z,
-				math.abs(cf.RightVector.Y) * size.X + math.abs(cf.UpVector.Y) * size.Y + math.abs(cf.LookVector.Y) * size.Z,
-				math.abs(cf.RightVector.Z) * size.X + math.abs(cf.UpVector.Z) * size.Y + math.abs(cf.LookVector.Z) * size.Z) / 2
-
-			local low, high = cf.Position - half, cf.Position + half
-
-			min = min and Vector3.new(math.min(min.X, low.X), math.min(min.Y, low.Y), math.min(min.Z, low.Z)) or low
-			max = max and Vector3.new(math.max(max.X, high.X), math.max(max.Y, high.Y), math.max(max.Z, high.Z)) or high
+		return tasks:InsertBack(open_task, proxy):Wait(template)
+	end,
+	Read = function(proxy, template)
+		local internal = get_internal(proxy, "Read")
+		local public, tasks = internal.__public, internal.task_manager
+		local pending = tasks:FindFirst(read_task)
+		if pending ~= nil then return pending:Wait(template) end
+		if public.State == true and tasks:FindLast(close_task) == nil then return "State", "Open" end --// read is for closed stores, an open one already has the value
+		return tasks:InsertBack(read_task, proxy):Wait(template)
+	end,
+	Save = function(proxy)
+		local internal = get_internal(proxy, "Save")
+		local public, tasks = internal.__public, internal.task_manager
+		if public.State == false then return "State", "Closed" end
+		if public.State == nil then return "State", "Destroyed" end
+		local pending = tasks:FindFirst(save_task)
+		if pending ~= nil then return pending:Wait() end
+		if tasks:FindLast(close_task) ~= nil then return "State", "Closing" end
+		if tasks:FindLast(destroy_task) ~= nil then return "State", "Destroying" end
+		return tasks:InsertBack(save_task, proxy):Wait()
+	end,
+	Close = function(proxy)
+		local internal = get_internal(proxy, "Close")
+		local public, tasks = internal.__public, internal.task_manager
+		if public.State == nil then return "Success" end
+		local pending = tasks:FindFirst(close_task)
+		if pending ~= nil then return pending:Wait() end
+		if public.State == false and tasks:FindLast(open_task) == nil then return "Success" end --// already closed and nothing is opening it
+		pending = tasks:FindFirst(destroy_task)
+		if pending ~= nil then return pending:Wait() end
+		stop_lock_timer(internal)
+		stop_save_timer(internal)
+		return tasks:InsertBack(close_task, proxy):Wait()
+	end,
+	Destroy = function(proxy)
+		local internal = get_internal(proxy, "Destroy")
+		local public, tasks = internal.__public, internal.task_manager
+		if public.State == nil then return "Success" end
+		data_stores[public.Id] = nil --// freed right away so new can make a fresh store for the same key
+		stop_lock_timer(internal)
+		stop_save_timer(internal)
+		return (tasks:FindFirst(destroy_task) or tasks:InsertBack(destroy_task, proxy)):Wait()
+	end,
+	Queue = function(proxy, value, expiration, priority)
+		local internal = get_internal(proxy, "Queue")
+		if expiration ~= nil and type(expiration) ~= "number" then error("Attempt to Queue failed: Passed value is not nil or number", 2) end
+		if priority ~= nil and type(priority) ~= "number" then error("Attempt to Queue failed: Passed value is not nil or number", 2) end
+		local success, error_message = retry(3, function() return internal.queue:AddAsync(value, expiration or 604800, priority) end) --// items last a week unless told otherwise
+		if success then return "Success" end
+		return "Error", error_message
+	end,
+	Remove = function(proxy, id)
+		local internal = get_internal(proxy, "Remove")
+		if type(id) ~= "string" then error("Attempt to Remove failed: Passed value is not a string", 2) end
+		local success, error_message = retry(3, function() return internal.queue:RemoveAsync(id) end)
+		if success then return "Success" end
+		return "Error", error_message
+	end,
+	Clone = function(proxy)
+		return clone(get_internal(proxy, "Clone").__public.Value)
+	end,
+	Reconcile = function(proxy, template)
+		apply_template(get_internal(proxy, "Reconcile").__public, template)
+	end,
+	Usage = function(proxy)
+		local public = get_internal(proxy, "Usage").__public
+		if public.Value == nil then return 0, 0 end
+		local measured = public.Value
+		if type(public.Metadata.Compress) == "table" then
+			local level, decimals, safety = compress_settings(public.Metadata)
+			public.CompressedValue = compress(public.Value, level, decimals, safety)
+			measured = public.CompressedValue --// the compressed size is what counts against the limit
 		end
-	end
-
-	return min and (min + max) / 2 or nil
-end
-
-function place_crop_at_point(crop: Model, pointCFrame: CFrame)
-	local scale = crop:GetScale()
-	local centre = cropGeometryCentre(crop)
-
-	if not centre or scale <= 0 then
-		crop:PivotTo(pointCFrame)
-
-		return
-	end
-
-	local scaledOffset = crop:GetPivot():PointToObjectSpace(centre)
-	local authoredOffset = scaledOffset / scale
-
-	crop:PivotTo(pointCFrame * CFrame.new(authoredOffset * (1 - scale)))
-end
-
-
-----
-
-
-return {
-	load = load_plants,
-	export = export_plants,
-	create = create_plant
+		local used = #http_service:JSONEncode(measured)
+		return used, used / 4194303 --// how much of the 4mb cap is used
+	end,
 }
+
+--// makes a setter that checks type and range so i dont write the same checks over and over
+local function ranged_setter(name, min, max)
+	return function(_, internal, value)
+		if type(value) ~= "number" then error(`Attempt to set {name} failed: Passed value is not a number`, 3) end
+		if value < min then error(`Attempt to set {name} failed: Passed value is less than {min}`, 3) end
+		if value > max then error(`Attempt to set {name} failed: Passed value is more than {max}`, 3)end
+		internal.__public[name] = value
+	end
+end
+
+local function table_setter(name)
+	return function(_, internal, value)
+		if type(value) ~= "table" then error(`Attempt to set {name} failed: Passed value is not a table`, 3) end
+		internal.__public[name] = value
+	end
+end
+
+data_store_class.__set = {
+	Metadata = table_setter("Metadata"),
+	UserIds = table_setter("UserIds"),
+	SaveDelay = ranged_setter("SaveDelay", 0, 10),
+	LockInterval = ranged_setter("LockInterval", 10, 1000),
+	LockAttempts = ranged_setter("LockAttempts", 1, 100),
+	SaveOnClose = function(_, internal, value)
+		if type(value) ~= "boolean" then error("Attempt to set SaveOnClose failed: Passed value is not a boolean", 3) end
+		internal.__public.SaveOnClose = value
+	end,
+	--// 0 turns autosave off, anything else must be 10 to 1000, so the plain ranged setter cant do it
+	SaveInterval = function(proxy, internal, value)
+		if type(value) ~= "number" then error("Attempt to set SaveInterval failed: Passed value is not a number", 3) end
+		if (value < 10 and value ~= 0) or value > 1000 then error("Attempt to set SaveInterval failed: Passed value is not 0 or between 10 and 1000", 3) end
+		local public = internal.__public
+		if value == public.SaveInterval then return end
+		public.SaveInterval = value
+		if public.State ~= true then return end --// timers only run while open
+		if value == 0 then
+			stop_save_timer(internal)
+		elseif not is_closing(internal) then
+			start_save_timer(proxy) --// restart so the new interval kicks in now
+		end
+	end,
+}
+
+for _, name in {"Id", "UniqueId", "Key", "State", "Hidden", "AttemptsRemaining", "CreatedTime", "UpdatedTime", "Version", "CompressedValue", "StateChanged", "Saving", "Saved", "AttemptsChanged", "ProcessQueue"} do
+	data_store_class.__set[name] = false --// false makes proxy block writes, these are read only
+end
+
+--// constructor
+
+local function build(id, name, scope, key, hidden)
+	local proxy, internal = Proxy.new(data_store_class, {
+		Metadata = {},
+		UserIds = {},
+		SaveInterval = 30,
+		SaveDelay = 0,
+		LockInterval = 60,
+		LockAttempts = 5,
+		SaveOnClose = true,
+		Id = id,
+		UniqueId = http_service:GenerateGUID(false), --// how a server tells its own lock from someone elses
+		Key = key,
+		State = false,
+		Hidden = hidden,
+		AttemptsRemaining = 0,
+		CreatedTime = 0,
+		UpdatedTime = 0,
+		Version = "",
+		CompressedValue = "",
+		StateChanged = Signal.new(),
+		Saving = Signal.new(),
+		Saved = Signal.new(),
+		AttemptsChanged = Signal.new(),
+		ProcessQueue = Signal.new(),
+	})
+	internal.task_manager = SynchronousTaskManager.new()
+	internal.lock_time = -math.huge --// minus infinity so a fresh store never looks locked
+	internal.save_time = -math.huge --// and never looks like it just saved
+	internal.active_lock_interval = 0
+	internal.processing_queue = false
+	internal.data_store = data_store_service:GetDataStore(name, scope)
+	internal.memory_store = memory_store_service:GetSortedMap(id)
+	internal.queue = memory_store_service:GetQueue(id)
+	internal.options = Instance.new("DataStoreSetOptions") --// reused every save to carry the metadata
+	internal.__public.ProcessQueue.DataStore = proxy --// so signal_connected can go back to the store
+	internal.__public.ProcessQueue.Connected = signal_connected
+	if active then bind_to_close[internal.__public.UniqueId] = proxy end
+	return proxy
+end
+
+local function make_id(name, scope, key)
+	if key == nil then key, scope = scope, "global" end
+	return name .. "/" .. scope .. "/" .. key, scope, key
+end
+
+constructor.new = function(name, scope, key)
+	local id, real_scope, real_key = make_id(name, scope, key)
+	if data_stores[id] ~= nil then return data_stores[id] end
+	local proxy = build(id, name, real_scope, real_key, false)
+	data_stores[id] = proxy
+	return proxy
+end
+
+--// hidden stores skip the data_stores list so they are never given on accident
+constructor.hidden = function(name, scope, key)
+	local id, real_scope, real_key = make_id(name, scope, key)
+	return build(id, name, real_scope, real_key, true)
+end
+
+constructor.find = function(name, scope, key)
+	return data_stores[(make_id(name, scope, key))]
+end
+
+constructor.Response = {Success = "Success", Saved = "Saved", Locked = "Locked", State = "State", Error = "Error"}
+
+--// shutdown
+
+--// every store gets destroyed so it saves and unlocks before the server lowk dies
+local function close_all()
+	active = false
+	for _, proxy in bind_to_close do
+		local internal = getmetatable(proxy)
+		if internal.__public.State == nil then continue end --// already destroyed
+		data_stores[internal.__public.Id] = nil
+		stop_lock_timer(internal)
+		stop_save_timer(internal)
+		if internal.task_manager:FindFirst(destroy_task) == nil then internal.task_manager:InsertBack(destroy_task, proxy) end
+	end
+	while next(bind_to_close) ~= nil do task.wait() end --// destroy_task removes each entry wait till the list is empty
+end
+
+if not run_service:IsStudio() then
+	game:BindToClose(close_all) --// skipped in studio or test sessions would hang on real datastores
+end
+
+return table.freeze(constructor) :: Constructor
