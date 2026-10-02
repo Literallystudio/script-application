@@ -3,7 +3,7 @@
 
 --// services
 
-local replicated_storage = game:GetService("ReplicatedStorage")
+local replicated_storage = game:GetService("ReplicatedStorage") --// remotes get made here and the shared catalog is read from here
 local players = game:GetService("Players")
 local http_service = game:GetService("HttpService")
 local data_store_service = game:GetService("DataStoreService")
@@ -19,10 +19,10 @@ type PressKind = "press" | "release"
 
 type Payload = {[string]: unknown} --// whatever a client sends, nothing in it is trusted till it goes thru one of the checks below
 
-type Note = {t: number, d: number?} --// d is an optional length on top of the note time
+type Note = {t: number, d: number?} --// t is the hit time in ms, d is an optional hold length on top of it
 type Chart = {Note}
-type SongChoice = {song: string, difficulty: string, chart: Chart}
-type SongPick = {song: string, difficulty: string}
+type SongChoice = {song: string, difficulty: string, chart: Chart} --// chart is carried along so the match doesnt have to look it up again
+type SongPick = {song: string, difficulty: string} --// what a player sends in PickSong, no chart cuz its re checked later
 type PressEvent = {t: PressKind, d: Direction}
 
 type SongModule = {Songs: {string}}
@@ -35,7 +35,7 @@ type SongCatalogApi = {
 type ConfigApi = {MaxScore: number}
 
 type PlayerStats = {Wins: number, Losses: number, Draws: number, Streak: number, BestStreak: number} --// these keys are whats saved in the datastore so the casing stays
-type Leaderstats = {Wins: IntValue, Losses: IntValue, Streak: IntValue}
+type Leaderstats = {Wins: IntValue, Losses: IntValue, Streak: IntValue} --// the player list only shows these 3
 type MatchReport = {score: number, forfeited: boolean} --// score is the only thing that decides a winner, forfeited overrides it
 
 type PartyListing = {Id: string, PartyName: string, Side: Side, Joinable: Joinable, WinCondition: WinCondition, RankedBy: WinCondition}
@@ -43,15 +43,15 @@ type PartyListing = {Id: string, PartyName: string, Side: Side, Joinable: Joinab
 --// everything the server can send on PvPRemote, payload.a tells the client which one it is
 type ServerMessage =
 	| {a: "Waiting", song: string, difficulty: string}
-	| {a: "Matched", role: Role, opponent: string, song: string, difficulty: string, countdown: number, matchId: string}
-	| {a: "OpponentLeft"}
-	| {a: "StatsUpdated", stats: PlayerStats}
-	| {a: "PartyListUpdated", parties: {PartyListing}}
-	| {a: "PartyReady", role: Role, opponent: string, matchId: string, pickSeconds: number}
+| {a: "Matched", role: Role, opponent: string, song: string, difficulty: string, countdown: number, matchId: string}
+| {a: "OpponentLeft"}
+| {a: "StatsUpdated", stats: PlayerStats}
+| {a: "PartyListUpdated", parties: {PartyListing}}
+| {a: "PartyReady", role: Role, opponent: string, matchId: string, pickSeconds: number}
 
 --// modules
 
-local SongCatalog = require(replicated_storage.ClientModules.SongCatalog) :: SongCatalogApi --// both are in repstorage so the client can read the same catalog and config
+local SongCatalog = require(replicated_storage.ClientModules.SongCatalog) :: SongCatalogApi --// in repstorage so the client reads the exact same catalog the server validates against
 local Config = require(replicated_storage.ClientModules.Config) :: ConfigApi --// casts cuz require hands back any and i only touch these bits
 
 --// remotes
@@ -66,13 +66,13 @@ end
 local press_relay = make_remote("RemoteEvent", "PressRelay") :: RemoteEvent --// note presses, just gets sent straight to the opponent
 local pvp_remote = make_remote("RemoteEvent", "PvPRemote") :: RemoteEvent --// queue, party and result stuff all comes thru here, payload.a says which one
 local pvp_stats_function = make_remote("RemoteFunction", "PvPStatsFunction") :: RemoteFunction --// function and not an event cuz the client wants the stats handed back
-local match_stats_store = data_store_service:GetDataStore("PvPStats_v1")
+local match_stats_store = data_store_service:GetDataStore("PvPStats_v1") --// versioned name so a format change later can start from a fresh store
 
 --// settings
 
 local max_events_per_batch = 40 --// checked before any looping so a huge batch costs nothing
 local max_batches_per_second = 30 --// presses spam a lot so batches get a way higher cap than menu stuff
-local max_actions_per_second = 5
+local max_actions_per_second = 5 --// menu actions are rare so a low cap is fine
 local countdown_seconds = 3 --// goes out in Matched so both clients start their count together
 local min_match_duration_seconds = 5 --// floor so a tiny chart still cant be finished instantly
 local min_duration_ratio = 0.85 --// how much of the chart length a real run has to take at least
@@ -88,7 +88,7 @@ local valid_win_conditions: {[string]: WinCondition} = {Score = "Score", Accurac
 --// checks, anything from a client is unknown till it gets thru one of these
 
 local function read_string(value: unknown): string?
-	return if typeof(value) == "string" then value else nil
+	return if typeof(value) == "string" then value else nil --// typeof narrows unknown to string for the return
 end
 
 local function read_number(value: unknown): number?
@@ -123,21 +123,20 @@ local function get_pvp_chart(song: string, difficulty: string): Chart?
 end
 
 local function get_random_song_pick(): SongChoice?
-	local candidates: {string} = {}
+	local candidates: {string} = {} --// flat list so every song has the same odds no matter which module holds it
 	for _, song_module in SongCatalog.Get() do --// catalog data is mine so plain iteration, ipairs only matters on client tables
 		for _, song in song_module.Songs do
 			if not SongCatalog.HasAnySoloRestriction(song) then table.insert(candidates, song) end --// songs w a solo restriction stay out of the pool
 		end
 	end
 	if #candidates == 0 then return nil end --// math.random errors on an empty range
-	local song = candidates[math.random(#candidates)] --// flat list so every song has the same odds no matter which module holds it
+	local song = candidates[math.random(#candidates)]
 	local charts = load_charts(song)
 	if not charts then return nil end
-	local difficulties: {string} = {}
+	local difficulties: {string} = {} --// charts is a dictionary so the names go in an array to pick one by index
 	for difficulty in charts do
-		if not SongCatalog.IsSoloOnly(song, difficulty) then table.insert(difficulties, difficulty) end --// each difficulty is judged on its own, same rule get_pvp_chart uses
+		table.insert(difficulties, difficulty) --// no solo check per difficulty, the candidate filter above already dropped any song that has one
 	end
-	if #difficulties == 0 then return nil end --// same math.random problem
 	local difficulty = difficulties[math.random(#difficulties)]
 	return {song = song, difficulty = difficulty, chart = charts[difficulty]} --// charts are already loaded here so no need to go thru get_pvp_chart again
 end
@@ -158,8 +157,8 @@ type RateWindow = {count: number, window_start: number}
 type RateLimiterFields = {max_per_second: number, windows: {[Player]: RateWindow}}
 
 local RateLimiter = {}
-RateLimiter.__index = RateLimiter
-type RateLimiter = typeof(setmetatable({} :: RateLimiterFields, RateLimiter))
+RateLimiter.__index = RateLimiter --// so instances fall back to the methods below
+type RateLimiter = typeof(setmetatable({} :: RateLimiterFields, RateLimiter)) --// lets strict mode type self in the methods
 
 function RateLimiter.new(max_per_second: number): RateLimiter
 	return setmetatable({max_per_second = max_per_second, windows = {}}, RateLimiter)
@@ -169,15 +168,13 @@ function RateLimiter.is_limited(self: RateLimiter, player: Player): boolean
 	local now = os.clock() --// os.clock is monotonic so a clock change cant reopen a window
 	local window = self.windows[player]
 	if not window then
-		self.windows[player] = {count = 1, window_start = now} --// first hit from this player, nothing to reuse yet
-		return false
-	end
-	if now - window.window_start >= 1 then
-		window.count = 1 --// fixed 1 sec window, the old table gets reused so presses dont make garbage
+		window = {count = 0, window_start = now} --// first hit from this player, nothing to reuse yet
+		self.windows[player] = window
+	elseif now - window.window_start >= 1 then
+		window.count = 0 --// fixed 1 sec window, the old table gets reused so presses dont make garbage
 		window.window_start = now
-		return false
 	end
-	window.count += 1 --// still inside the window so this hit just adds to the count
+	window.count += 1 --// both branches above start from 0 so this hit is always counted the same way
 	return window.count > self.max_per_second --// hits up to the cap go thru, the one after it is the first to get dropped
 end
 
@@ -254,7 +251,8 @@ end
 
 function Stats.save(self: Stats)
 	local values = self.values
-	task.spawn(pcall, match_stats_store.UpdateAsync, match_stats_store, tostring(self.user_id), function() return values end) --// spawned so a slow datastore cant hold up the match result, pcall so a failed save doesnt error the thread
+	local key = tostring(self.user_id)
+	task.spawn(pcall, match_stats_store.UpdateAsync, match_stats_store, key, function() return values end) --// spawned so a slow datastore cant hold up the match result, pcall so a failed save doesnt error the thread
 end
 
 --// match, one per pair of players from the start till the result is decided
@@ -266,7 +264,13 @@ Match.__index = Match
 type Match = typeof(setmetatable({} :: MatchFields, Match))
 
 function Match.new(id: string, first: Player, second: Player, chart: Chart): Match
-	return setmetatable({id = id, players = {first, second}, start_time = os.clock(), min_duration = get_min_duration(chart), reports = {}}, Match) --// start_time is what is_too_early measures against
+	return setmetatable({
+		id = id,
+		players = {first, second},
+		start_time = os.clock(), --// is_too_early measures against this
+		min_duration = get_min_duration(chart),
+		reports = {},
+	}, Match)
 end
 
 function Match.has_reported(self: Match, player: Player): boolean
@@ -278,7 +282,7 @@ function Match.is_too_early(self: Match): boolean
 end
 
 function Match.submit(self: Match, player: Player, report: MatchReport)
-	self.reports[player] = report
+	self.reports[player] = report --// callers check has_reported first so this never overwrites
 end
 
 function Match.opponent_of(self: Match, player: Player): Player
@@ -315,11 +319,18 @@ Party.__index = Party
 type Party = typeof(setmetatable({} :: PartyFields, Party))
 
 function Party.new(owner: Player, side: Side, joinable: Joinable, win_condition: WinCondition): Party
-	return setmetatable({id = http_service:GenerateGUID(false), owner = owner, members = {owner}, side = side, joinable = joinable, win_condition = win_condition}, Party) --// members starts as just the owner, lock adds the joiner
+	return setmetatable({
+		id = http_service:GenerateGUID(false),
+		owner = owner,
+		members = {owner}, --// starts as just the owner, lock adds the joiner
+		side = side,
+		joinable = joinable,
+		win_condition = win_condition,
+	}, Party)
 end
 
 function Party.is_open_for(self: Party, viewer: Player): boolean
-	return self.match_id == nil and self.joinable == "Everyone" and self.owner.Parent ~= nil and self.owner ~= viewer --// u never see ur own party as joinable
+	return self.match_id == nil and self.joinable == "Everyone" and self.owner ~= viewer --// u never see ur own party as joinable, and a party whose owner left is already gone from parties
 end
 
 function Party.to_listing(self: Party): PartyListing
@@ -470,7 +481,15 @@ local function opposite_role(role: Role): Role
 end
 
 local function announce_match(player: Player, role: Role, opponent: Player, choice: SongChoice, match_id: string)
-	send(player, {a = "Matched", role = role, opponent = opponent.Name, song = choice.song, difficulty = choice.difficulty, countdown = countdown_seconds, matchId = match_id})
+	send(player, {
+		a = "Matched",
+		role = role,
+		opponent = opponent.Name,
+		song = choice.song,
+		difficulty = choice.difficulty,
+		countdown = countdown_seconds,
+		matchId = match_id,
+	})
 end
 
 --// queue and party pick both end up here so matches get set up the same either way
@@ -527,7 +546,7 @@ end
 --// picked song only counts if its still playable (match needs its chart anyway), otherwise random
 local function choose_party_song(pick: SongPick?): SongChoice?
 	local chart = if pick then get_pvp_chart(pick.song, pick.difficulty) else nil
-	if pick and chart then return {song = pick.song, difficulty = pick.difficulty, chart = chart} end
+	if pick and chart then return {song = pick.song, difficulty = pick.difficulty, chart = chart} end --// both checked together so strict mode knows neither is nil here
 	return get_random_song_pick()
 end
 
