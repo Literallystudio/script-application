@@ -1,449 +1,473 @@
 --// Connected Discord-GitHub
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage") --// replicatedstorage service duh
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Objects = ReplicatedStorage.Access.Value --// folder with the module paths
+local Access = ReplicatedStorage:WaitForChild("Access")
+local Objects = Access.Value or Access.Changed:Wait() --// value can be nil on the client until the ObjectValue replicates
 
-local Config = require(Objects:WaitForChild("SkillTreeConfig").Value) --// config module
-local Signal = require(Objects:WaitForChild("SkillTreeSignal").Value) --// signal module
+local Config = require(Objects:WaitForChild("SkillTreeConfig").Value)
+local Signal = require(Objects:WaitForChild("SkillTreeSignal").Value) --// the class fires signals so it never needs to know about ui or saving
 
-local Codes = Config.Codes --// result codes shortcut
-local States = Config.States --// skill states shortcut
-local EMPTY = table.freeze({}) --// shared empty table so we dont make new ones
+local Codes = Config.Codes
+local States = Config.States
+local EMPTY = table.freeze({}) --// shared stand-in for missing optional tables, "x or EMPTY" allocates nothing
 
-local SkillTreeClass = {} --// the class
-SkillTreeClass.__index = SkillTreeClass --// lets objects use the class methods
+--// one tree object is shared by all players. player data only lives in the raw table the caller passes in
+local SkillTreeClass = {}
+SkillTreeClass.__index = SkillTreeClass
 
---// Helpers
-local function deepFreeze(t) --// freezes a table and everything inside it
-	if table.isfrozen(t) then --// already frozen
-		return --// nothing to do
+--// helpers
+local function deepFreeze(t) --// table.freeze is shallow
+	if table.isfrozen(t) then --// also the visited check, so shared sub tables are skipped
+		return
 	end
-	for _, v in t do --// loop the values
-		if type(v) == "table" then --// only tables can be frozen
-			deepFreeze(v) --// freeze the inner table first
+	table.freeze(t) --// frozen before the walk so a self-referencing table stops at the check above
+	for _, v in t do
+		if type(v) == "table" then
+			deepFreeze(v)
 		end
 	end
-	table.freeze(t) --// freeze this one
 end
 
-local function toSet(raw) --// unlocked list to a set
-	local set = {} --// new set
-	for _, id in raw.UnlockedSkills do --// loop unlocked ids
-		set[id] = true --// mark as unlocked
+local function toSet(raw) --// array to set, so "is this parent owned" is one index and not a table.find scan
+	local set = {}
+	for _, id in raw.UnlockedSkills do
+		set[id] = true
 	end
-	return set --// return the set
+	return set
 end
 
-local function isNumber(value) --// checks for a real number
-	return type(value) == "number" and value == value and math.abs(value) < math.huge --// not nan and not inf
+local function isNumber(value) --// nan and inf both pass type() == "number" but break the layout math
+	return type(value) == "number" and value == value and math.abs(value) < math.huge
 end
 
-local function assertOptionalNumber(value, label, id) --// optional number check
-	assert(value == nil or isNumber(value), label .. " must be a number (skill " .. id .. ")") --// nil or a real number
+local function assertOptionalNumber(value, label, id)
+	assert(value == nil or isNumber(value), label .. " must be a number (skill " .. id .. ")")
 end
 
-local function validatePrevious(tree, id, previous) --// checks the Previous list
-	assert(type(previous) == "table", "Previous must be a table (skill " .. id .. ")") --// has to be a table
-	for _, prevId in previous do --// loop each requirement
-		assert(type(prevId) == "number", "Previous ids must be numbers (skill " .. id .. ")") --// id must be a number
-		assert(prevId ~= id, "skill cannot require itself (skill " .. id .. ")") --// cant require itself
-		assert(tree[prevId], "unknown Previous " .. tostring(prevId) .. " (skill " .. id .. ")") --// skill has to exist
-	end
-end
-
-local function validateSkill(tree, id, skill) --// checks one skill
-	assert(type(id) == "number", "skill ids must be numbers") --// id must be a number
-	assert(type(skill) == "table", "skill must be a table (skill " .. id .. ")") --// skill must be a table
-	assert(Config.IsCount(skill.SkillCost), "SkillCost must be a non-negative integer (skill " .. id .. ")") --// cost must be a whole number
-	assert(type(skill.info) == "table", "missing info (skill " .. id .. ")") --// needs an info table
-	assert(skill.RequireAll == nil or type(skill.RequireAll) == "boolean", "RequireAll must be a boolean (skill " .. id .. ")") --// nil or boolean
-	assertOptionalNumber(skill.OnGridLine, "OnGridLine", id) --// check the line
-	assertOptionalNumber(skill.OnGridColumn, "OnGridColumn", id) --// check the column
-	local align = skill.AlignTo or EMPTY --// AlignTo or an empty table
-	assert(type(align) == "table", "AlignTo must be a table (skill " .. id .. ")") --// has to be a table
-	assertOptionalNumber(align.OnGridLine, "AlignTo.OnGridLine", id) --// check the align line
-	assertOptionalNumber(align.OnGridColumn, "AlignTo.OnGridColumn", id) --// check the align column
-	if skill.Previous then --// only if it has requirements
-		validatePrevious(tree, id, skill.Previous) --// check them
+local function validatePrevious(tree, id, previous) --// checks ids against the raw tree, so table order doesnt matter
+	assert(type(previous) == "table", "Previous must be a table (skill " .. id .. ")")
+	for _, prevId in previous do
+		assert(type(prevId) == "number", "Previous ids must be numbers (skill " .. id .. ")")
+		assert(prevId ~= id, "skill cannot require itself (skill " .. id .. ")")
+		assert(tree[prevId], "unknown Previous " .. tostring(prevId) .. " (skill " .. id .. ")") --// this is what makes tree[prevId] safe everywhere else
 	end
 end
 
-local function hasCycle(tree) --// looks for loops in the tree
-	local state = {} --// 1 is visiting, 2 is done
-	local function visit(id) --// checks one skill
-		if state[id] then --// already seen
-			return state[id] == 1 --// still visiting means its a loop
+local function validateSkill(tree, id, skill)
+	assert(type(id) == "number", "skill ids must be numbers") --// ids get sorted in the layout, a string would error in table.sort
+	assert(type(skill) == "table", "skill must be a table (skill " .. id .. ")")
+	assert(Config.IsCount(skill.SkillCost), "SkillCost must be a non-negative integer (skill " .. id .. ")") --// same rule GivePoints uses
+	assert(type(skill.info) == "table", "missing info (skill " .. id .. ")") --// never read here, just guaranteed for whatever consumes the skill
+	assert(skill.RequireAll == nil or type(skill.RequireAll) == "boolean", "RequireAll must be a boolean (skill " .. id .. ")") --// DefaultReach checks == true, so the string "true" would act as false
+	assertOptionalNumber(skill.OnGridLine, "OnGridLine", id)
+	assertOptionalNumber(skill.OnGridColumn, "OnGridColumn", id)
+	local align = skill.AlignTo or EMPTY
+	assert(type(align) == "table", "AlignTo must be a table (skill " .. id .. ")")
+	assertOptionalNumber(align.OnGridLine, "AlignTo.OnGridLine", id)
+	assertOptionalNumber(align.OnGridColumn, "AlignTo.OnGridColumn", id)
+	if skill.Previous then
+		validatePrevious(tree, id, skill.Previous)
+	end
+end
+
+--// dfs with 3 states, reaching a skill that is still on the current path is a back edge, so a cycle
+local function hasCycle(tree)
+	local state = {} --// nil = unseen, 1 = on the path, 2 = done
+	local function visit(id)
+		if state[id] then --// a done skill is just a parent shared by several children, only 1 is a loop
+			return state[id] == 1
 		end
-		state[id] = 1 --// mark as visiting
-		for _, prevId in tree[id].Previous or EMPTY do --// loop the requirements
-			if visit(prevId) then --// loop found deeper
-				return true --// pass it up
+		state[id] = 1
+		for _, prevId in tree[id].Previous or EMPTY do --// ids are valid by now, SetSkillTree validates before calling this
+			if visit(prevId) then
+				return true
 			end
 		end
-		state[id] = 2 --// mark as done
-		return false --// no loop here
+		state[id] = 2
+		return false
 	end
-	for id in tree do --// check every skill
-		if visit(id) then --// found a loop
-			return true --// stop here
+	for id in tree do --// tree can be disconnected, so every skill is tried as a start
+		if visit(id) then
+			return true
 		end
 	end
-	return false --// no loops
+	return false
 end
 
-local function computeDepths(tree) --// depth of every skill
-	local depth = {} --// saved depths
-	local function visit(id) --// gets one depth
-		if depth[id] then --// already saved
-			return depth[id] --// return it
+local function computeDepths(tree) --// longest path from a root, memoised
+	local depth = {}
+	local function visit(id) --// no cycle guard, SetSkillTree rejects cycles first
+		if depth[id] then
+			return depth[id]
 		end
-		local d = 1 --// roots are depth 1
-		for _, prevId in tree[id].Previous or EMPTY do --// loop the requirements
-			d = math.max(d, visit(prevId) + 1) --// one deeper than the deepest parent
+		local d = 1
+		for _, prevId in tree[id].Previous or EMPTY do
+			d = math.max(d, visit(prevId) + 1) --// max over all parents so a skill never sits left of one of its parents
 		end
-		depth[id] = d --// save it
-		return d --// return it
+		depth[id] = d
+		return d
 	end
-	for id in tree do --// every skill
-		visit(id) --// get its depth
+	for id in tree do
+		visit(id)
 	end
-	return depth --// return all depths
+	return depth
 end
 
-local function hasPrevious(skill) --// checks for requirements
-	return skill.Previous ~= nil and #skill.Previous > 0 --// has at least one
+local function hasPrevious(skill) --// Previous = {} counts as a root too
+	return skill.Previous ~= nil and #skill.Previous > 0
 end
 
-local function canReach(self, player, unlocked, skillId) --// safe reach check
-	local ok, result = pcall(self._reach, self, skillId, unlocked, player) --// pcall so errors dont break it
-	return ok and result == true --// only true counts
+local function canReach(self, player, unlocked, skillId)
+	local ok, result = pcall(self._reach, self, skillId, unlocked, player) --// _reach is a plain function stored on the instance, so self is passed by hand
+	return ok and result == true --// fails closed: an error or a truthy non boolean never turns into an unlock
 end
 
---// Reach and constructor
-function SkillTreeClass.DefaultReach(tree, skillId, unlocked, player) --// default reach rule
-	local skill = tree:GetSkill(skillId) --// get the skill
-	if not skill then --// skill doesnt exist
-		return false --// cant reach it
+--// reach and constructor
+
+--// public so a custom handler can wrap it. handlers get (tree, skillId, unlocked, player) and return true/false
+function SkillTreeClass.DefaultReach(tree, skillId, unlocked, player)
+	local skill = tree:GetSkill(skillId)
+	if not skill then
+		return false
 	end
-	if not hasPrevious(skill) then --// no requirements
-		return true --// always reachable
+	if not hasPrevious(skill) then
+		return true --// roots are always reachable, otherwise nothing could be unlocked first
 	end
-	local needAll = skill.RequireAll == true --// all parents or just one
-	for _, prevId in skill.Previous do --// loop the parents
-		if needAll and not unlocked[prevId] then --// missing a parent
-			return false --// cant reach it
+	local needAll = skill.RequireAll == true --// AND (every parent) or OR (any parent)
+	for _, prevId in skill.Previous do
+		if needAll and not unlocked[prevId] then
+			return false
 		end
-		if not needAll and unlocked[prevId] then --// has one parent
-			return true --// can reach it
+		if not needAll and unlocked[prevId] then
+			return true
 		end
 	end
-	return needAll --// true if all were owned
+	return needAll --// nothing decided early: AND had every parent (true), OR had none (false)
 end
 
-function SkillTreeClass.new(treeId: string) --// makes a new tree
-	assert(type(treeId) == "string" and treeId ~= "", "treeId must be a non-empty string") --// id must be a real string
-	return setmetatable({ --// give it the class methods
-		Id = treeId, --// tree id
-		SkillUnlocked = Signal.new(), --// fires on unlock
-		SkillsReset = Signal.new(), --// fires on reset
-		_tree = nil, --// skill data
-		_layout = nil, --// saved layout
-		_reach = SkillTreeClass.DefaultReach, --// reach rule
-		_otherReq = nil, --// extra requirement
-		_uiGen = nil, --// ui builder
-		_hover = nil, --// hover callback
-		_click = nil, --// click callback
+function SkillTreeClass.new(treeId: string) --// dot call, there is no instance yet
+	assert(type(treeId) == "string" and treeId ~= "", "treeId must be a non-empty string")
+	--// _tree, _layout, _otherReq, _uiGen, _hover and _click are set by the setters. the getters check _tree (and BuildUI _uiGen) before use
+	return setmetatable({
+		Id = treeId, --// goes into the ui payload as TreeId
+		SkillUnlocked = Signal.new(),
+		SkillsReset = Signal.new(),
+		_reach = SkillTreeClass.DefaultReach, --// per instance, so one tree can swap its rule without touching the class
 	}, SkillTreeClass)
 end
 
-function SkillTreeClass:SetSkillTree(tree) --// loads the skill data
-	for id, skill in tree do --// loop the skills
-		validateSkill(tree, id, skill) --// check each one
+function SkillTreeClass:SetSkillTree(tree)
+	for id, skill in tree do --// validate everything before touching self, so a failed assert leaves the old tree and layout in place
+		validateSkill(tree, id, skill)
 	end
-	assert(not hasCycle(tree), "skill tree contains a cycle") --// no loops allowed
-	deepFreeze(tree) --// lock the data
-	self._tree = tree --// save it
-	self._layout = nil --// clear the old layout
+	assert(not hasCycle(tree), "skill tree contains a cycle") --// after the loop, hasCycle relies on the Previous ids being proven real
+	deepFreeze(tree) --// GetSkills and the ui payload return this exact table. also freezes the callers table
+	self._tree = tree
+	self._layout = nil --// cached layout belongs to the old tree
 end
 
-function SkillTreeClass:HasSkillTree(): boolean --// checks if a tree is loaded
-	return self._tree ~= nil --// true if loaded
+function SkillTreeClass:HasSkillTree(): boolean
+	return self._tree ~= nil
 end
 
-function SkillTreeClass:GetSkill(skillId) --// gets one skill
-	if type(skillId) ~= "number" or not self._tree then --// bad id or no tree
-		return nil --// nothing to return
+function SkillTreeClass:GetSkill(skillId)
+	if type(skillId) ~= "number" or not self._tree then --// ids can come from player input
+		return nil
 	end
-	return self._tree[skillId] --// the skill
+	return self._tree[skillId]
 end
 
-function SkillTreeClass:GetSkills() --// gets all skills
-	return self._tree --// the tree
+function SkillTreeClass:GetSkills() --// safe to hand out, its frozen
+	return self._tree
 end
 
-function SkillTreeClass:SetSkillTreeReachHandler(reachHandler, otherUnlockingRequirements) --// custom reach rule and extra requirement
-	if reachHandler then --// one was given
-		self._reach = reachHandler --// save it
+function SkillTreeClass:SetSkillTreeReachHandler(reachHandler, otherUnlockingRequirements)
+	if reachHandler then --// nil never wipes what was set, so either arg can be set alone
+		self._reach = reachHandler --// no validation, canReach pcalls it
 	end
-	self._otherReq = otherUnlockingRequirements --// save the extra requirement
-end
-
-function SkillTreeClass:SetUIGenerationHandler(handler) --// sets the ui builder
-	self._uiGen = handler --// save it
-end
-
-function SkillTreeClass:SetSkillTreeUIHandlers(mouseHovered, mouseClicked) --// sets the mouse callbacks
-	self._hover = mouseHovered --// save hover
-	self._click = mouseClicked --// save click
-end
-
-function SkillTreeClass:GetUIHandlers() --// gets the mouse callbacks
-	return self._hover, self._click --// hover and click
-end
-
---// State and unlocking
-function SkillTreeClass:IsUnlocked(raw, skillId): boolean --// checks if its unlocked
-	return table.find(raw.UnlockedSkills, skillId) ~= nil --// is it in the list
-end
-
-function SkillTreeClass:IsInReach(player, raw, skillId): boolean --// checks if its reachable
-	return canReach(self, player, toSet(raw), skillId) --// run the reach check
-end
-
-function SkillTreeClass:CheckRequirements(player, skillId): boolean --// checks the extra requirement
-	local skill = self:GetSkill(skillId) --// get the skill
-	if not skill then --// skill doesnt exist
-		return false --// fail
+	if otherUnlockingRequirements then
+		self._otherReq = otherUnlockingRequirements
 	end
-	local fn = skill.OtherUnlockingRequirements or self._otherReq --// skill check first then global
-	if not fn then --// no extra requirement
-		return true --// pass
-	end
-	local ok, result = pcall(fn, player, skill, skillId) --// pcall so errors dont break it
-	return ok and result == true --// only true passes
 end
 
-function SkillTreeClass:GetState(player, raw, skillId) --// gets one skill state
-	if self:IsUnlocked(raw, skillId) then --// owned
-		return States.Unlocked --// unlocked
-	end
-	if self:IsInReach(player, raw, skillId) then --// reachable
-		return States.Unlockable --// can unlock
-	end
-	return States.Locked --// locked
+function SkillTreeClass:SetUIGenerationHandler(handler)
+	self._uiGen = handler
 end
 
-function SkillTreeClass:GetStates(player, raw) --// gets every skill state
-	local unlocked = toSet(raw) --// make the set once
-	local states = {} --// all states
-	for id in self._tree do --// loop the skills
-		if unlocked[id] then --// owned
-			states[id] = States.Unlocked --// unlocked
-			continue --// skip the reach check
+function SkillTreeClass:SetSkillTreeUIHandlers(mouseHovered, mouseClicked) --// only stored, the class never calls them
+	self._hover = mouseHovered
+	self._click = mouseClicked
+end
+
+function SkillTreeClass:GetUIHandlers()
+	return self._hover, self._click
+end
+
+--// state and unlocking
+function SkillTreeClass:IsUnlocked(raw, skillId): boolean --// linear scan is fine for one skill, bulk callers use toSet
+	return table.find(raw.UnlockedSkills, skillId) ~= nil
+end
+
+function SkillTreeClass:IsInReach(player, raw, skillId): boolean --// builds a set per call, GetStates builds one for all skills
+	return canReach(self, player, toSet(raw), skillId)
+end
+
+function SkillTreeClass:CheckRequirements(player, skillId): boolean
+	local skill = self:GetSkill(skillId)
+	if not skill then
+		return false
+	end
+	local fn = skill.OtherUnlockingRequirements or self._otherReq --// the skills own rule replaces the global one, they never both run
+	if not fn then
+		return true
+	end
+	local ok, result = pcall(fn, player, skill, skillId) --// fn comes from outside (quests, level gates), an error in it must not break unlocking
+	return ok and result == true
+end
+
+--// state is graph position only. points and OtherUnlockingRequirements are left to CheckUnlock
+function SkillTreeClass:GetState(player, raw, skillId)
+	if self:IsUnlocked(raw, skillId) then --// owned first, so an owned skill never shows as unlockable
+		return States.Unlocked
+	end
+	if self:IsInReach(player, raw, skillId) then
+		return States.Unlockable
+	end
+	return States.Locked
+end
+
+function SkillTreeClass:GetStates(player, raw) --// bulk GetState for BuildUI
+	if not self._tree then
+		return {}
+	end
+	local unlocked = toSet(raw) --// built once, GetState per skill would rebuild it every time
+	local states = {}
+	for id in self._tree do
+		if unlocked[id] then
+			states[id] = States.Unlocked
+			continue --// skips the reach call, which costs a pcall plus the handler
 		end
-		states[id] = canReach(self, player, unlocked, id) and States.Unlockable or States.Locked --// unlockable or locked
+		states[id] = canReach(self, player, unlocked, id) and States.Unlockable or States.Locked
 	end
-	return states --// return all states
+	return states
 end
 
-function SkillTreeClass:CheckUnlock(player, raw, skillId): number --// checks if it can be unlocked
-	local skill = self:GetSkill(skillId) --// get the skill
-	if not skill then --// skill doesnt exist
-		return Codes.InvalidSkill --// invalid skill
+--// pure check. ordered from basic failures down to points, so the caller gets the first reason that applies
+function SkillTreeClass:CheckUnlock(player, raw, skillId): number
+	local skill = self:GetSkill(skillId)
+	if not skill then
+		return Codes.InvalidSkill
 	end
-	if self:IsUnlocked(raw, skillId) then --// already owned
-		return Codes.AlreadyUnlocked --// already unlocked
+	if self:IsUnlocked(raw, skillId) then
+		return Codes.AlreadyUnlocked
 	end
-	if not self:IsInReach(player, raw, skillId) then --// only checks this skill
-		return Codes.NotInReach --// parents missing
+	if not self:IsInReach(player, raw, skillId) then --// only looks at direct parents, an owned parent already passed its own checks since unlocks only happen thru Unlock
+		return Codes.NotInReach
 	end
-	if not self:CheckRequirements(player, skillId) then --// extra requirement
-		return Codes.RequirementFailed --// requirement failed
+	if not self:CheckRequirements(player, skillId) then --// after reach, so the custom function only runs for reachable skills
+		return Codes.RequirementFailed
 	end
-	if raw.AvailablePoints - raw.UsedPoints < skill.SkillCost then --// spare points vs cost
-		return Codes.NotEnoughPoints --// too broke lol
+	if raw.AvailablePoints - raw.UsedPoints < skill.SkillCost then --// last, so a structural failure is reported over "not enough points"
+		return Codes.NotEnoughPoints
 	end
-	return Codes.Success --// all good
+	return Codes.Success
 end
 
-function SkillTreeClass:ApplyUnlocked(raw, skillId, player) --// saves the unlock
-	local skill = self:GetSkill(skillId) --// get the skill
-	if not skill or self:IsUnlocked(raw, skillId) then --// bad id or already owned
-		return false --// failed
+--// local on purpose, it skips every check. Unlock is the only way in
+local function applyUnlock(self, raw, skillId, player)
+	local skill = self._tree[skillId]
+	table.insert(raw.UnlockedSkills, skillId)
+	raw.UsedPoints += skill.SkillCost --// spent points are tracked, not remaining ones, so Reset just sets this to 0
+	self.SkillUnlocked:Fire(skillId, player) --// fired after raw changes so listeners read the new state
+end
+
+function SkillTreeClass:Unlock(player, raw, skillId): number
+	local code = self:CheckUnlock(player, raw, skillId) --// a code and not a bool, so the caller can tell the player why it failed
+	if code ~= Codes.Success then
+		return code
 	end
-	table.insert(raw.UnlockedSkills, skillId) --// add to the unlocked list
-	raw.UsedPoints += skill.SkillCost --// spend the points
-	self.SkillUnlocked:Fire(skillId, player) --// fire the signal
-	return true --// worked
+	applyUnlock(self, raw, skillId, player) --// only a yielding custom requirement could let state change between check and apply
+	return Codes.Success
 end
 
-function SkillTreeClass:Unlock(player, raw, skillId): number --// unlocks a skill
-	local code = self:CheckUnlock(player, raw, skillId) --// check first
-	if code ~= Codes.Success then --// something failed
-		return code --// return the code
+function SkillTreeClass:Reset(raw, player)
+	table.clear(raw.UnlockedSkills) --// cleared in place so saving and replication holding this table see it
+	raw.UsedPoints = 0 --// AvailablePoints stays, so every spent point is spendable again
+	self.SkillsReset:Fire(player)
+end
+
+function SkillTreeClass:GivePoints(raw, amount): number
+	if not Config.IsCount(amount) or raw.AvailablePoints + amount > Config.MaxPoints then --// IsCount rejects negatives, fractions and nan. the cap is on the total so repeated calls cant pass it
+		return Codes.InvalidArgs
 	end
-	self:ApplyUnlocked(raw, skillId, player) --// apply it
-	return Codes.Success --// success
+	raw.AvailablePoints += amount
+	return Codes.Success
 end
 
-function SkillTreeClass:Reset(raw, player) --// resets the tree
-	table.clear(raw.UnlockedSkills) --// clear the list
-	raw.UsedPoints = 0 --// refund the points
-	self.SkillsReset:Fire(player) --// fire the signal
-end
-
-function SkillTreeClass:GivePoints(raw, amount): number --// adds skill points
-	if not Config.IsCount(amount) or raw.AvailablePoints + amount > Config.MaxPoints then --// bad amount or over the cap
-		return Codes.InvalidArgs --// invalid
+--// layout helpers
+local function sortedIds(tree) --// pairs order isnt guaranteed, sorting keeps the layout identical on every machine
+	local ids = {}
+	for id in tree do
+		table.insert(ids, id)
 	end
-	raw.AvailablePoints += amount --// add the points
-	return Codes.Success --// success
+	table.sort(ids)
+	return ids
 end
 
---// Layout helpers
-local function sortedIds(tree) --// sorted list of ids
-	local ids = {} --// the list
-	for id in tree do --// loop the skills
-		table.insert(ids, id) --// add the id
-	end
-	table.sort(ids) --// sort it
-	return ids --// return it
-end
-
-local function orderByDepth(ids, depth) --// sorts ids by depth
-	local ordered = table.clone(ids) --// copy the list
-	table.sort(ordered, function(a, b) --// sort the copy
-		if depth[a] ~= depth[b] then --// different depths
-			return depth[a] < depth[b] --// shallow first
+local function orderByDepth(ids, depth)
+	local ordered = table.clone(ids)
+	table.sort(ordered, function(a, b)
+		if depth[a] ~= depth[b] then --// parents always have a smaller depth, so their positions exist when a child is placed
+			return depth[a] < depth[b]
 		end
-		return a < b --// same depth so lowest id first
+		return a < b
 	end)
-	return ordered --// return it
+	return ordered
 end
 
-local function buildChildren(tree, ids) --// parent to children map
-	local children = {} --// the map
-	for _, id in ids do --// loop the skills
-		if not hasPrevious(tree[id]) then --// root skill
-			continue --// skip it
+local function buildChildren(tree, ids) --// each skill is filed under its first Previous only, so placement sees a plain tree. other parents only matter for edges and the line average
+	local children = {}
+	for _, id in ids do
+		if not hasPrevious(tree[id]) then
+			continue
 		end
-		local parent = tree[id].Previous[1] --// first requirement is the main parent
-		children[parent] = children[parent] or {} --// make the list if needed
-		table.insert(children[parent], id) --// add the child
+		local parent = tree[id].Previous[1]
+		children[parent] = children[parent] or {} --// no entry means a leaf, place() relies on that
+		table.insert(children[parent], id)
 	end
-	return children --// return the map
+	return children
 end
 
-local function computeAutoLines(tree, ids, children) --// automatic line for every skill
-	local autoLine = {} --// saved lines
-	local nextSlot = 0 --// next free line
-	local function place(id) --// places one skill
-		local kids = children[id] --// its children
-		if not kids then --// no children
-			nextSlot += 1 --// take the next line
-			autoLine[id] = nextSlot --// save it
-			return --// done
+--// leaves take consecutive lines and a parent sits over the middle of its children
+local function computeAutoLines(tree, ids, children)
+	local autoLine = {} --// parents end up with fractional lines
+	local nextSlot = 0
+	local function place(id)
+		local kids = children[id]
+		if not kids then
+			nextSlot += 1
+			autoLine[id] = nextSlot
+			return
 		end
-		local sum = 0 --// total of the children lines
-		for _, kid in kids do --// loop the children
-			place(kid) --// place the child first
-			sum += autoLine[kid] --// add its line
+		local sum = 0
+		for _, kid in kids do
+			place(kid)
+			sum += autoLine[kid]
 		end
-		autoLine[id] = sum / #kids --// middle of the children
+		autoLine[id] = sum / #kids
 	end
-	for _, id in ids do --// loop the skills
-		if not hasPrevious(tree[id]) then --// root skill
-			place(id) --// place the branch
+	for _, id in ids do
+		if not hasPrevious(tree[id]) then --// only roots start a branch, the rest are placed as descendants
+			place(id)
 		end
 	end
-	return autoLine --// return the lines
+	return autoLine
 end
 
-local function resolveLine(skill, id, positions, autoLine) --// final line for a skill
-	local manual = (skill.AlignTo or EMPTY).OnGridLine or skill.OnGridLine --// manual line
-	if manual then --// one was set
-		return manual --// use it
+local function resolveLine(skill, id, positions, autoLine)
+	local manual = (skill.AlignTo or EMPTY).OnGridLine or skill.OnGridLine --// AlignTo wins over the plain field
+	if manual then
+		return manual, true --// the skill still took its slot in computeAutoLines, so neighbours dont move
 	end
-	if not hasPrevious(skill) or #skill.Previous < 2 then --// zero or one parent
-		return autoLine[id] --// use the auto line
+	if not hasPrevious(skill) or #skill.Previous < 2 then
+		return autoLine[id]
 	end
-	local sum = 0 --// total of the parent lines
-	for _, prevId in skill.Previous do --// loop the parents
-		sum += positions[prevId][1] --// add the parent line
+	local sum = 0
+	for _, prevId in skill.Previous do
+		sum += positions[prevId][1] --// parents are already final, computePositions goes shallow first
 	end
-	return sum / #skill.Previous --// middle of the parents
+	return sum / #skill.Previous
 end
 
-local function computePositions(tree, ordered, depth, autoLine) --// line and column for every skill
-	local positions = {} --// saved positions
-	for _, id in ordered do --// shallow first
-		local skill = tree[id] --// current skill
-		local column = (skill.AlignTo or EMPTY).OnGridColumn or skill.OnGridColumn or depth[id] --// manual column or depth
-		positions[id] = {resolveLine(skill, id, positions, autoLine), column} --// save the position
+--// skills sharing the same parents all land on the parents average. first one keeps the cell, the rest slide down
+local function claimLine(taken, column, line, isManual)
+	local used = taken[column]
+	if not used then
+		used = {}
+		taken[column] = used
 	end
-	return positions --// return them
+	while not isManual and used[line] do --// manual lines never move
+		line += 1
+	end
+	used[line] = true
+	return line
 end
 
-local function getBounds(positions) --// min and max of the grid
-	local minLine, maxLine = math.huge, -math.huge --// line limits
-	local minColumn, maxColumn = math.huge, -math.huge --// column limits
-	for _, pos in positions do --// loop the positions
-		minLine = math.min(minLine, pos[1]) --// lowest line
-		maxLine = math.max(maxLine, pos[1]) --// highest line
-		minColumn = math.min(minColumn, pos[2]) --// lowest column
-		maxColumn = math.max(maxColumn, pos[2]) --// highest column
+local function computePositions(tree, ordered, depth, autoLine)
+	local taken = {}
+	local positions = {}
+	for _, id in ordered do
+		local skill = tree[id]
+		local column = (skill.AlignTo or EMPTY).OnGridColumn or skill.OnGridColumn or depth[id] --// manual first, otherwise depth
+		local line, isManual = resolveLine(skill, id, positions, autoLine)
+		positions[id] = {claimLine(taken, column, line, isManual), column} --// {line, column}
 	end
-	return minLine, maxLine, minColumn, maxColumn --// all four limits
+	return positions
 end
 
---// Layout
-function SkillTreeClass:GetLayout() --// builds the layout for the ui
-	if self._layout then --// already built
-		return self._layout --// return the saved one
+local function getBounds(positions) --// one pass for all four limits
+	local minLine, maxLine = math.huge, -math.huge
+	local minColumn, maxColumn = math.huge, -math.huge
+	for _, pos in positions do
+		minLine = math.min(minLine, pos[1])
+		maxLine = math.max(maxLine, pos[1])
+		minColumn = math.min(minColumn, pos[2])
+		maxColumn = math.max(maxColumn, pos[2])
 	end
-	local tree = self._tree --// shorter name
-	local ids = sortedIds(tree) --// sorted ids
-	local depth = computeDepths(tree) --// depths
-	local autoLine = computeAutoLines(tree, ids, buildChildren(tree, ids)) --// automatic lines
-	local positions = computePositions(tree, orderByDepth(ids, depth), depth, autoLine) --// final positions
-	local minLine, maxLine, minColumn, maxColumn = getBounds(positions) --// grid limits
-	local lineSpan = maxLine - minLine + 1 --// total lines
-	local columnSpan = maxColumn - minColumn + 1 --// total columns
-	local nodes, edges = {}, {} --// output tables
-	for _, id in ipairs(ids) do --// loop the skills in order
-		local skill, pos = tree[id], positions[id] --// skill and its position
-		nodes[id] = { --// node data
-			Id = id, --// skill id
-			Line = pos[1], --// line
-			Column = pos[2], --// column
-			X = (pos[2] - minColumn + 0.5) / columnSpan, --// x from 0 to 1
-			Y = (pos[1] - minLine + 0.5) / lineSpan, --// y from 0 to 1
-			Expands = (skill.AlignTo or EMPTY).Expands == true, --// should it expand
-			Previous = skill.Previous, --// parents
+	return minLine, maxLine, minColumn, maxColumn
+end
+
+--// layout
+function SkillTreeClass:GetLayout() --// depends only on the frozen tree, so its built once. BuildUI runs often but this part never changes
+	if self._layout then
+		return self._layout
+	end
+	if not self._tree then
+		return nil
+	end
+	local tree = self._tree
+	local ids = sortedIds(tree)
+	local depth = computeDepths(tree)
+	local autoLine = computeAutoLines(tree, ids, buildChildren(tree, ids)) --// step 1: tree shaped lines
+	local positions = computePositions(tree, orderByDepth(ids, depth), depth, autoLine) --// step 2: manual and multi parent overrides
+	local minLine, maxLine, minColumn, maxColumn = getBounds(positions) --// step 3: limits for normalising
+	local lineSpan = maxLine - minLine + 1 --// +1 because both end cells are occupied
+	local columnSpan = maxColumn - minColumn + 1
+	local nodes, edges = {}, {}
+	for _, id in ipairs(ids) do
+		local skill, pos = tree[id], positions[id]
+		nodes[id] = {
+			Id = id,
+			Line = pos[1],
+			Column = pos[2],
+			X = (pos[2] - minColumn + 0.5) / columnSpan, --// 0..1 with a half cell offset so the node sits mid cell and the ui can scale to any frame
+			Y = (pos[1] - minLine + 0.5) / lineSpan,
+			Expands = (skill.AlignTo or EMPTY).Expands == true,
+			Previous = skill.Previous, --// same frozen table, no copy
 		}
-		for _, prevId in skill.Previous or EMPTY do --// loop the parents
-			table.insert(edges, {From = prevId, To = id}) --// add a link
+		for _, prevId in skill.Previous or EMPTY do --// edges use every parent, so the ui draws all requirements even though placement only followed the first
+			table.insert(edges, {From = prevId, To = id})
 		end
 	end
-	self._layout = {Lines = lineSpan, Columns = columnSpan, Nodes = nodes, Edges = edges} --// save the layout
-	deepFreeze(self._layout) --// lock it
-	return self._layout --// return it
+	self._layout = {Lines = lineSpan, Columns = columnSpan, Nodes = nodes, Edges = edges} --// assigned last so an error above never caches a half built layout
+	deepFreeze(self._layout) --// shared by every caller, so nobody can edit it for the rest
+	return self._layout
 end
 
---// UI
-function SkillTreeClass:BuildUI(player, raw) --// sends the ui data to the builder
-	if not self._tree or not self._uiGen then --// missing tree or builder
-		return --// nothing to build
+--// ui
+function SkillTreeClass:BuildUI(player, raw)
+	if not self._tree or not self._uiGen then
+		return
 	end
-	self._uiGen({ --// call the ui builder
-		TreeId = self.Id, --// tree id
-		Layout = self:GetLayout(), --// layout
-		Skills = self._tree, --// skill data
-		States = self:GetStates(player, raw), --// skill states
-		UsedPoints = raw.UsedPoints, --// spent points
-		AvailablePoints = raw.AvailablePoints, --// total player points
+	self._uiGen({ --// layout and skills come from cache, states and points are rebuilt since they depend on this players raw
+		TreeId = self.Id,
+		Layout = self:GetLayout(),
+		Skills = self._tree,
+		States = self:GetStates(player, raw),
+		UsedPoints = raw.UsedPoints,
+		AvailablePoints = raw.AvailablePoints, --// total, spare points are this minus UsedPoints
 	})
 end
 
-return SkillTreeClass --// return the module
+return SkillTreeClass
